@@ -1,9 +1,7 @@
 import { z } from "zod";
-import { and, eq, inArray } from "drizzle-orm";
-import { db } from "@/db";
-import { categories, products } from "@/db/schema";
 import { api, ApiError, readJson, rateLimit } from "@/lib/server/http";
 import { requireCtx } from "@/lib/server/auth";
+import { tenantRepos } from "@/lib/repositories";
 import { digitizer } from "@/lib/server/providers";
 import { serverEnv } from "@/config/env";
 import { logActivity } from "@/lib/server/audit";
@@ -35,27 +33,28 @@ export const POST = api<{ action: string }>(async (req, { action }) => {
         categories: z.array(z.object({ name: z.string().trim().min(1).max(80), items: z.array(z.object({ name: z.string().trim().min(1).max(120), price: z.number().min(0).max(1_000_000), description: z.string().max(300).optional() })).max(300) })).max(60),
       })
       .parse(await readJson(req));
-    const result = await db.transaction(async (tx) => {
-      const existing = await tx.select().from(categories).where(eq(categories.restaurantId, ctx.restaurantId));
-      const byName = new Map(existing.map((c) => [c.name.toLowerCase(), c.id]));
-      let nc = 0, np = 0, order = existing.length;
-      for (const c of v.categories) {
-        let cid = byName.get(c.name.toLowerCase());
-        if (!cid) {
-          cid = (await tx.insert(categories).values({ restaurantId: ctx.restaurantId, name: c.name, sortOrder: order++ }).returning({ id: categories.id }))[0].id;
-          byName.set(c.name.toLowerCase(), cid);
-          nc++;
-        }
-        const have = await tx.select({ n: products.name }).from(products).where(and(eq(products.restaurantId, ctx.restaurantId), eq(products.categoryId, cid), inArray(products.name, c.items.map((i) => i.name))));
-        const skip = new Set(have.map((h) => h.n.toLowerCase()));
-        const rows = c.items.filter((i) => !skip.has(i.name.toLowerCase())).map((i, idx) => ({ restaurantId: ctx.restaurantId, categoryId: cid!, name: i.name, slug: slugify(i.name), description: i.description ?? "", price: Math.round(i.price * 100), sortOrder: idx }));
-        if (rows.length) await tx.insert(products).values(rows);
-        np += rows.length;
+    // Firestore transactions cap at 500 writes, so the import is applied in batched writes; it is idempotent by
+    // (category name, product name) so re-running an interrupted import never duplicates rows.
+    const T = tenantRepos(ctx.restaurantId);
+    const existing = await T.categories.list({ limit: 500 });
+    const byName = new Map(existing.map((c) => [c.name.toLowerCase(), c.id]));
+    let nc = 0, np = 0, order = existing.length;
+    for (const c of v.categories) {
+      let cid = byName.get(c.name.toLowerCase());
+      if (!cid) {
+        const now = new Date();
+        cid = (await T.categories.create(null, { name: c.name, imageUrl: "", sortOrder: order++, isActive: true, createdAt: now, updatedAt: now })).id;
+        byName.set(c.name.toLowerCase(), cid);
+        nc++;
       }
-      await logActivity(ctx, "menu.ai_imported", "menu", ctx.restaurantId, null, { categories: nc, products: np }, tx);
-      return { categories: nc, products: np };
-    });
-    return result;
+      const have = await T.products.list({ where: [["categoryId", "==", cid]], limit: 1000 });
+      const skip = new Set(have.map((h) => h.name.toLowerCase()));
+      const fresh = c.items.filter((i) => !skip.has(i.name.toLowerCase()));
+      await Promise.all(fresh.map((i, idx) => T.products.create(null, { categoryId: cid!, name: i.name, slug: slugify(i.name), description: i.description ?? "", imageUrl: "", price: Math.round(i.price * 100), availability: "AVAILABLE", isPopular: false, isRecommended: false, isVeg: false, variantGroupIds: [], addonIds: [], sortOrder: idx, isActive: true, createdAt: new Date(), updatedAt: new Date() })));
+      np += fresh.length;
+    }
+    await logActivity(ctx, "menu.ai_imported", "menu", ctx.restaurantId, null, { categories: nc, products: np });
+    return { categories: nc, products: np };
   }
   throw new ApiError("Not found", 404);
 });

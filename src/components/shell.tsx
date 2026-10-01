@@ -5,10 +5,12 @@ import { createContext, Suspense, useContext, useEffect, useRef, useState, type 
 import { Bell, BarChart3, Boxes, ChefHat, ClipboardList, Gift, LayoutDashboard, LogOut, Menu as MenuIcon, MessageCircle, QrCode, Receipt, Search, Settings, ShoppingCart, Star, Store, Tag, Ticket, Users, WifiOff, X, Wallet, Layers, PlusSquare, Carrot, Sparkles, MailWarning } from "lucide-react";
 import { can, homeFor, type AppModule } from "@/lib/permissions";
 import { apiFetch, post, useApi, useDebounced } from "@/lib/client/api";
-import { cx, EmptyState, Notice } from "./ui";
+import { useNotificationsLive } from "@/lib/client/realtime";
+import { signOutEverywhere } from "@/lib/firebase/auth";
+import { cx, EmptyState, Notice, UploadScope } from "./ui";
 import { Logo } from "./marketing";
 
-type Restaurant = { name: string; slug: string; logoUrl: string; accent: string; currency: string; timezone: string };
+type Restaurant = { id: string; name: string; slug: string; logoUrl: string; accent: string; currency: string; timezone: string };
 type ShellCtx = { role: string; restaurant: Restaurant; user: { name: string; email: string; emailVerified: boolean }; appName: string };
 const Ctx = createContext<ShellCtx | null>(null);
 export const useShell = () => useContext(Ctx)!;
@@ -101,7 +103,10 @@ function NavList({ onNavigate }: { onNavigate?: () => void }) {
 
 function Notifications() {
   const [open, setOpen] = useState(false);
-  const { data, reload } = useApi<{ items: { id: string; type: string; title: string; body: string; isRead: boolean; createdAt: string }[]; unread: number }>("/api/dash/notifications", { poll: 10000 });
+  const { restaurant } = useShell();
+  type N = { type: string; title: string; body: string; isRead: boolean; createdAt: string };
+  const live = useNotificationsLive<N>(restaurant.id);
+  const data = live.data ? { items: live.data, unread: live.data.filter((n) => !n.isRead).length } : null;
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const h = (e: MouseEvent) => ref.current && !ref.current.contains(e.target as Node) && setOpen(false);
@@ -116,7 +121,7 @@ function Notifications() {
       </button>
       {open && (
         <div className="anim-pop absolute right-0 z-50 mt-2 w-80 max-w-[90vw] rounded-xl border border-line bg-surface shadow-2xl">
-          <div className="flex items-center justify-between border-b border-line px-4 py-3"><p className="text-sm font-semibold">Notifications</p>{!!data?.unread && <button className="text-xs text-accent" onClick={async () => { await post("/api/dash/notifications-read"); reload(); }}>Mark all read</button>}</div>
+          <div className="flex items-center justify-between border-b border-line px-4 py-3"><p className="text-sm font-semibold">Notifications</p>{!!data?.unread && <button className="text-xs text-accent" onClick={async () => { await post("/api/dash/notifications-read"); }}>Mark all read</button>}</div>
           <ul className="max-h-96 overflow-y-auto">
             {!data?.items.length && <li className="px-4 py-8 text-center text-sm text-muted">You’re all caught up.</li>}
             {data?.items.map((n) => (
@@ -174,13 +179,14 @@ export function Shell({ children, ...ctx }: ShellCtx & { children: ReactNode; wh
   useEffect(() => { Promise.resolve().then(() => setDrawer(false)); }, [path]);
 
   async function logout() {
-    await post("/api/auth/logout");
+    await signOutEverywhere();
     window.location.href = "/login";
   }
   const bottom = ([["/dashboard", "Home", LayoutDashboard, "dashboard"], ["/dashboard/pos", "POS", ShoppingCart, "pos"], ["/dashboard/orders", "Orders", ClipboardList, "orders"], ["/dashboard/kds", "KDS", ChefHat, "kds"]] as const).filter((b) => can(role, b[3] as AppModule));
 
   return (
     <Ctx.Provider value={ctx}>
+      <UploadScope.Provider value={restaurant.id}>
       <div style={{ ["--accent" as string]: accent, ["--accent-fg" as string]: contrast(accent) }} className="min-h-screen">
         <aside className="no-print fixed inset-y-0 left-0 z-30 hidden w-64 flex-col border-r border-line bg-surface md:flex">
           <div className="flex h-16 shrink-0 items-center gap-3 border-b border-line px-5">
@@ -228,6 +234,7 @@ export function Shell({ children, ...ctx }: ShellCtx & { children: ReactNode; wh
           <button onClick={() => setDrawer(true)} className="flex flex-1 flex-col items-center gap-0.5 py-2.5 text-[11px] text-muted"><MenuIcon className="size-5" />More</button>
         </nav>
       </div>
+      </UploadScope.Provider>
     </Ctx.Provider>
   );
 }

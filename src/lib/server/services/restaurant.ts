@@ -1,13 +1,14 @@
-import { restaurants } from "@/db/schema";
+import type { Restaurant } from "@/lib/repositories";
 import { resolveSettings } from "./orders";
 
-export function publicRestaurant(r: typeof restaurants.$inferSelect) {
+/** Tenant-member projection of a restaurant: resolved settings, platform fee values enforced from env. */
+export function publicRestaurant(r: Restaurant) {
   const { settings, ...rest } = r;
   return { ...rest, settings: resolveSettings(settings) };
 }
 
 /** Customer-safe projection of a restaurant (no owner ids, no coordinates). */
-export function customerRestaurant(r: typeof restaurants.$inferSelect) {
+export function customerRestaurant(r: Restaurant) {
   const s = resolveSettings(r.settings);
   return {
     name: r.name,

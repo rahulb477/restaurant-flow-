@@ -1,16 +1,16 @@
 import type { Metadata } from "next";
-import { and, eq } from "drizzle-orm";
-import { db } from "@/db";
-import { restaurants, diningTables } from "@/db/schema";
+import { repos } from "@/lib/repositories";
 import { CustomerMenu } from "@/components/customer-menu";
 
 export const dynamic = "force-dynamic";
 
 export async function generateMetadata({ params }: { params: Promise<{ slug: string; token: string }> }): Promise<Metadata> {
   const { slug, token } = await params;
-  const r = (await db.select({ id: restaurants.id, name: restaurants.name }).from(restaurants).where(eq(restaurants.slug, slug)).limit(1))[0];
+  const R = repos();
+  const id = await R.lookup.resolveSlug(slug).catch(() => null);
+  const r = id ? await R.restaurants.get(id).catch(() => null) : null;
   if (!r) return { title: "Menu" };
-  const t = (await db.select({ name: diningTables.name }).from(diningTables).where(and(eq(diningTables.restaurantId, r.id), eq(diningTables.qrToken, token))).limit(1))[0];
+  const t = await R.tenant(r.id).tables.getByQrToken(token).catch(() => null);
   return { title: `${r.name}${t ? ` · Table ${t.name}` : ""}`, description: `Scan, order and pay at ${r.name}.`, robots: { index: false } };
 }
 

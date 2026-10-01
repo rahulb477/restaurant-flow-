@@ -1,7 +1,7 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { BarChart3, ChefHat, Gift, Boxes, QrCode, Receipt, Star, Store, Tags, UtensilsCrossed, Sparkles, CreditCard, MapPin, ShieldCheck } from "lucide-react";
-import { publicEnv } from "@/config/env";
+import { publicEnv } from "@/config/public-env";
 
 export const Logo = ({ className = "" }: { className?: string }) => (
   <span className={`inline-flex items-center gap-2 font-display text-lg font-semibold tracking-tight ${className}`}>

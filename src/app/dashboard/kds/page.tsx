@@ -2,9 +2,10 @@
 import { useEffect, useState } from "react";
 import { BookOpen, Flame, Check, Play } from "lucide-react";
 import { patch, useApi } from "@/lib/client/api";
+import { useKitchenLive } from "@/lib/client/realtime";
 import { Button, EmptyState, ErrorState, Modal, Skeleton, useToast, cx } from "@/components/ui";
 import { ItemLines, type OrderRow } from "@/components/order-ui";
-import { RoleGate } from "@/components/shell";
+import { RoleGate, useShell } from "@/components/shell";
 
 type Recipes = { recipes: { productId: string; items: { ingredientId: string; quantity: number }[]; notes: string }[]; ingredients: { id: string; name: string; unit: string }[] };
 const COLS = [["NEW", "New", ["CONFIRMED"]], ["PREP", "Preparing", ["PREPARING"]], ["READY", "Ready", ["READY"]], ["DONE", "Completed", ["SERVED", "COMPLETED"]]] as const;
@@ -27,7 +28,11 @@ function Elapsed({ since }: { since: string }) {
 
 function KDS() {
   const toast = useToast();
-  const { data, error, loading, reload } = useApi<{ items: OrderRow[] }>("/api/orders?board=1&limit=100", { poll: 3000 });
+  const { restaurant } = useShell();
+  const live = useKitchenLive<OrderRow & { orderId: string }>(restaurant.id);
+  const { error, loading } = live;
+  const data = live.data ? { items: live.data as unknown as OrderRow[] } : null;
+  const reload = () => undefined; // the ticket listener updates the board as soon as the server commits
   const rec = useApi<Recipes>("/api/dash/recipes");
   const [busy, setBusy] = useState<string | null>(null);
   const [recipeFor, setRecipeFor] = useState<OrderRow | null>(null);

@@ -1,81 +1,83 @@
 import crypto from "node:crypto";
 import { cache } from "react";
 import { cookies, headers } from "next/headers";
-import { and, eq, gt, asc } from "drizzle-orm";
-import { db } from "@/db";
-import { users, sessions, members, restaurants } from "@/db/schema";
+import { getAdminAuth } from "@/lib/firebase/admin";
+import { repos, type Restaurant, type Role } from "@/lib/repositories";
+import { serverEnv } from "@/config/env";
 import { ApiError } from "./http";
 import { can, type AppModule } from "@/lib/permissions";
 
-const COOKIE = "cp_session";
-const SESSION_DAYS = 30;
+/** `__session` is the only cookie Firebase Hosting / Cloud Run proxies forward. */
+export const SESSION_COOKIE = "__session";
 
 export const sha256 = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
 export const randomToken = (bytes = 32) => crypto.randomBytes(bytes).toString("hex");
-
-export function hashPassword(pw: string) {
-  const salt = crypto.randomBytes(16).toString("hex");
-  const hash = crypto.scryptSync(pw, salt, 64).toString("hex");
-  return `s1$${salt}$${hash}`;
-}
-export function verifyPassword(pw: string, stored: string) {
-  const [v, salt, hash] = stored.split("$");
-  if (v !== "s1" || !salt || !hash) return false;
-  const test = crypto.scryptSync(pw, salt, 64);
-  const orig = Buffer.from(hash, "hex");
-  return orig.length === test.length && crypto.timingSafeEqual(orig, test);
-}
-
-export async function createSession(userId: string) {
-  const token = randomToken();
-  const expiresAt = new Date(Date.now() + SESSION_DAYS * 86400_000);
-  await db.insert(sessions).values({ tokenHash: sha256(token), userId, expiresAt });
-  const h = await headers();
-  const secure = h.get("x-forwarded-proto") === "https";
-  (await cookies()).set(COOKIE, token, { httpOnly: true, sameSite: "lax", secure, path: "/", expires: expiresAt });
-}
-
-export async function destroySession() {
-  const jar = await cookies();
-  const token = jar.get(COOKIE)?.value;
-  if (token) await db.delete(sessions).where(eq(sessions.tokenHash, sha256(token)));
-  jar.delete(COOKIE);
-}
+/** URL-safe token for public QR / order links (stable, unguessable). */
+export const publicToken = (bytes = 18) => crypto.randomBytes(bytes).toString("base64url");
 
 export type SessionUser = { id: string; email: string; name: string; emailVerified: boolean };
 
+/**
+ * Exchanges a freshly minted Firebase ID token for an httpOnly session cookie.
+ * Firebase requires a recent sign-in; stale tokens are rejected.
+ */
+export async function createSession(idToken: string): Promise<SessionUser> {
+  const auth = getAdminAuth();
+  let decoded;
+  try {
+    decoded = await auth.verifyIdToken(idToken, true);
+  } catch {
+    throw new ApiError("Your sign-in could not be verified. Please try again.", 401, "UNAUTHENTICATED");
+  }
+  if (Date.now() / 1000 - decoded.auth_time > 5 * 60) throw new ApiError("Please sign in again to continue.", 401, "RECENT_LOGIN_REQUIRED");
+  const days = Math.min(Math.max(serverEnv.SESSION_COOKIE_DAYS, 1), 14);
+  const expiresIn = days * 86400_000;
+  const cookie = await auth.createSessionCookie(idToken, { expiresIn });
+  const h = await headers();
+  const secure = h.get("x-forwarded-proto") === "https" || process.env.NODE_ENV === "production";
+  (await cookies()).set(SESSION_COOKIE, cookie, { httpOnly: true, sameSite: "lax", secure, path: "/", maxAge: Math.floor(expiresIn / 1000) });
+  return { id: decoded.uid, email: decoded.email ?? "", name: (decoded.name as string | undefined) ?? "", emailVerified: !!decoded.email_verified };
+}
+
+export async function destroySession() {
+  (await cookies()).delete(SESSION_COOKIE);
+}
+
 export const getSessionUser = cache(async (): Promise<SessionUser | null> => {
-  const token = (await cookies()).get(COOKIE)?.value;
-  if (!token) return null;
-  const rows = await db
-    .select({ id: users.id, email: users.email, name: users.name, emailVerified: users.emailVerified })
-    .from(sessions)
-    .innerJoin(users, eq(users.id, sessions.userId))
-    .where(and(eq(sessions.tokenHash, sha256(token)), gt(sessions.expiresAt, new Date())))
-    .limit(1);
-  return rows[0] ?? null;
+  const cookie = (await cookies()).get(SESSION_COOKIE)?.value;
+  if (!cookie) return null;
+  try {
+    const d = await getAdminAuth().verifySessionCookie(cookie, true);
+    const profile = await repos().users.get(d.uid);
+    return { id: d.uid, email: d.email ?? profile?.email ?? "", name: (d.name as string | undefined) ?? profile?.name ?? "", emailVerified: !!d.email_verified };
+  } catch (e) {
+    if (e instanceof ApiError) throw e; // Firebase not configured is a server problem, not "signed out"
+    return null; // expired / revoked / malformed cookie
+  }
 });
 
-export type Restaurant = typeof restaurants.$inferSelect;
-export type Ctx = { user: SessionUser; restaurant: Restaurant; role: string; restaurantId: string };
+export type Ctx = { user: SessionUser; restaurant: Restaurant; role: Role; restaurantId: string };
 
-/** Resolves the caller's tenant from DB membership – never from client input. */
+/**
+ * Resolves the caller's tenant from Firestore membership — never from client input.
+ * The role comes from `restaurants/{id}/members/{uid}`; a DISABLED or missing member gets no context.
+ */
 export const getCtx = cache(async (): Promise<Ctx | null> => {
   const user = await getSessionUser();
   if (!user) return null;
-  const rows = await db
-    .select({ restaurant: restaurants, role: members.role })
-    .from(members)
-    .innerJoin(restaurants, eq(restaurants.id, members.restaurantId))
-    .where(and(eq(members.userId, user.id), eq(members.status, "ACTIVE")))
-    .orderBy(asc(members.createdAt))
-    .limit(1);
-  const r = rows[0];
-  if (!r) return null;
-  return { user, restaurant: r.restaurant, role: r.role, restaurantId: r.restaurant.id };
+  const r = repos();
+  const profile = await r.users.get(user.id);
+  for (const rid of profile?.restaurantIds ?? []) {
+    const m = await r.tenant(rid).members.get(user.id);
+    if (!m || m.status !== "ACTIVE") continue;
+    const restaurant = await r.restaurants.get(rid);
+    if (!restaurant) continue;
+    return { user, restaurant, role: m.role, restaurantId: rid };
+  }
+  return null;
 });
 
-/** For API routes. Throws 401/403 unless caller is a member whose role may access `mod`. */
+/** For API routes. Throws 401/403 unless caller is an active member whose role may access `mod`. */
 export async function requireCtx(mod?: AppModule | AppModule[]): Promise<Ctx> {
   const ctx = await getCtx();
   if (!ctx) {

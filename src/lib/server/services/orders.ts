@@ -1,29 +1,5 @@
 import crypto from "node:crypto";
-import { and, eq, inArray, sql } from "drizzle-orm";
-import { db } from "@/db";
-import {
-  restaurants,
-  products,
-  variantGroups,
-  addons,
-  categories,
-  diningTables,
-  coupons,
-  couponRedemptions,
-  customers,
-  orders,
-  payments,
-  bills,
-  usageLedger,
-  recipes,
-  ingredients,
-  inventoryTransactions,
-  loyaltyPrograms,
-  loyaltyRewards,
-  scratchCampaigns,
-  scratchIssuances,
-  type OrderLine,
-} from "@/db/schema";
+import { repos, type DiningTable, type Order, type OrderLine, type Tx, type TenantRepositories } from "@/lib/repositories";
 import {
   OrderError,
   priceLine,
@@ -46,10 +22,7 @@ import {
   type AddonLike,
 } from "@/lib/calculations";
 import { serverEnv } from "@/config/env";
-import { notify } from "../audit";
-
-export type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
-type Order = typeof orders.$inferSelect;
+import { publicToken, sha256 } from "../auth";
 
 /** Fee amount & settlement threshold are platform-controlled (env), never tenant-editable. */
 export const resolveSettings = (raw: unknown): Settings => {
@@ -79,349 +52,365 @@ export type CreateOrderInput = {
   manualDiscount?: number;
   idempotencyKey?: string;
   location?: { lat: number; lng: number } | null;
-  payment?: { method: "CASH" | "UPI" | "ONLINE"; reference?: string } | null;
+  payment?: { method: "CASH" | "UPI"; reference?: string } | null;
   createdBy?: string | null;
   dryRun?: boolean;
 };
 
-class DryRun {
-  constructor(public order: Order) {}
+type Writer = () => void;
+const noop: Writer = () => {};
+
+/** Stable customer id: one Firestore document per phone (or email), so upserts are idempotent. */
+export const customerIdFor = (key: string) => sha256(key).slice(0, 24);
+/** Deterministic inventory-ledger id: a second deduction for the same order+ingredient can never be created. */
+export const deductionTxId = (orderId: string, ingredientId: string) => `${orderId}_${ingredientId}_ORDER_DEDUCTION`;
+export const orderIdForKey = (restaurantId: string, key: string) => sha256(`${restaurantId}:${key}`).slice(0, 20);
+
+export async function usageBalance(restaurantId: string) {
+  const c = await repos().tenant(restaurantId).usage.getCounters();
+  return { balance: c.usageBalance, orders: c.usageOrders };
 }
 
-export async function usageBalance(tx: DbTx | typeof db, restaurantId: string) {
-  const r = await tx
-    .select({ total: sql<number>`coalesce(sum(${usageLedger.amount}),0)::int`, n: sql<number>`count(*)::int` })
-    .from(usageLedger)
-    .where(and(eq(usageLedger.restaurantId, restaurantId), eq(usageLedger.status, "CHARGED")));
-  return { balance: r[0].total, orders: r[0].n };
-}
-
+/* =============================== create order =============================== */
 export async function createOrder(input: CreateOrderInput): Promise<{ order: Order; existing: boolean }> {
   if (!input.items.length) throw new OrderError("Add at least one item to the order.", "EMPTY_ORDER");
   if (input.items.length > 60) throw new OrderError("Too many items in one order.");
   const staff = input.source !== "QR";
-  try {
-    return await db.transaction(async (tx) => {
-      // idempotency: same key => same order
-      if (input.idempotencyKey) {
-        const ex = await tx
-          .select()
-          .from(orders)
-          .where(and(eq(orders.restaurantId, input.restaurantId), eq(orders.idempotencyKey, input.idempotencyKey)))
-          .limit(1);
-        if (ex[0]) return { order: ex[0], existing: true };
-      }
-      const rest = (await tx.select().from(restaurants).where(eq(restaurants.id, input.restaurantId)).limit(1))[0];
-      if (!rest) throw new OrderError("Restaurant not found.", "NOT_FOUND", 404);
-      const settings = resolveSettings(rest.settings);
+  const R = repos();
+  const T = R.tenant(input.restaurantId);
 
-      // table resolution (token for public, id for staff)
-      let table: typeof diningTables.$inferSelect | undefined;
-      if (input.tableToken) {
-        table = (await tx.select().from(diningTables).where(and(eq(diningTables.restaurantId, rest.id), eq(diningTables.qrToken, input.tableToken))).limit(1))[0];
-        if (!table || !table.isActive) throw new OrderError("This QR code is no longer valid. Please ask staff for help.", "QR_INVALID", 404);
-      } else if (input.tableId) {
-        table = (await tx.select().from(diningTables).where(and(eq(diningTables.restaurantId, rest.id), eq(diningTables.id, input.tableId))).limit(1))[0];
-        if (!table) throw new OrderError("Table not found.", "TABLE_INVALID", 404);
-      }
+  const rest = await R.restaurants.get(input.restaurantId);
+  if (!rest) throw new OrderError("Restaurant not found.", "NOT_FOUND", 404);
+  const settings = resolveSettings(rest.settings);
 
-      if (!staff) {
-        if (!settings.customerOrdering) throw new OrderError("Ordering is currently paused. Please order at the counter.", "ORDERING_DISABLED", 403);
-        if (table && !settings.tableOrdering) throw new OrderError("Table ordering is currently disabled.", "ORDERING_DISABLED", 403);
-        const geo = input.dryRun ? { allowed: true as const, reason: "" } : checkGeofence(settings.geofence, input.location);
-        if (!geo.allowed) {
-          throw new OrderError(
-            geo.reason === "LOCATION_REQUIRED" ? "Please allow location access so we can confirm you are at the restaurant." : "You appear to be outside the restaurant. Ordering is only available on-site.",
-            "GEOFENCE",
-            403,
-          );
-        }
-        if (settings.fees.blockOnThreshold) {
-          const u = await usageBalance(tx, rest.id);
-          if (u.balance >= settings.fees.thresholdMinor) throw new OrderError("This restaurant cannot accept new online orders right now. Please order at the counter.", "USAGE_BLOCKED", 403);
-        }
-      }
+  /* table resolution (token for public, id for staff) — a token only resolves inside its own tenant */
+  let table: DiningTable | null = null;
+  if (input.tableToken) {
+    table = await T.tables.getByQrToken(input.tableToken);
+    if (!table || !table.isActive) throw new OrderError("This QR code is no longer valid. Please ask staff for help.", "QR_INVALID", 404);
+  } else if (input.tableId) {
+    table = await T.tables.get(input.tableId);
+    if (!table) throw new OrderError("Table not found.", "TABLE_INVALID", 404);
+  }
 
-      // load catalogue (tenant-scoped)
-      const productIds = Array.from(new Set(input.items.map((i) => i.productId).filter((x): x is string => !!x)));
-      const prodRows = productIds.length ? await tx.select().from(products).where(and(eq(products.restaurantId, rest.id), inArray(products.id, productIds))) : [];
-      const prodMap = new Map(prodRows.map((p) => [p.id, p]));
-      const groupRows = await tx.select().from(variantGroups).where(eq(variantGroups.restaurantId, rest.id));
-      const groupMap = new Map<string, VariantGroupLike>(groupRows.map((g) => [g.id, g]));
-      const addonRows = await tx.select().from(addons).where(eq(addons.restaurantId, rest.id));
-      const addonMap = new Map<string, AddonLike>(addonRows.map((a) => [a.id, a]));
-      const catRows = await tx.select().from(categories).where(eq(categories.restaurantId, rest.id));
-      const catName = new Map(catRows.map((c) => [c.id, c.name]));
+  if (!staff) {
+    if (!settings.customerOrdering) throw new OrderError("Ordering is currently paused. Please order at the counter.", "ORDERING_DISABLED", 403);
+    if (table && !settings.tableOrdering) throw new OrderError("Table ordering is currently disabled.", "ORDERING_DISABLED", 403);
+    const geo = input.dryRun ? { allowed: true as const, reason: "" } : checkGeofence(settings.geofence, input.location);
+    if (!geo.allowed) {
+      throw new OrderError(
+        geo.reason === "LOCATION_REQUIRED" ? "Please allow location access so we can confirm you are at the restaurant." : "You appear to be outside the restaurant. Ordering is only available on-site.",
+        "GEOFENCE",
+        403,
+      );
+    }
+  }
 
-      const lines: OrderLine[] = input.items.map((it) => {
-        const lineId = crypto.randomUUID();
-        if (it.custom) {
-          if (!staff) throw new OrderError("Custom items can only be added by staff.", "FORBIDDEN", 403);
-          const price = Math.round(it.custom.price);
-          const qty = Math.floor(it.qty);
-          if (!it.custom.name.trim() || price < 0 || qty < 1 || qty > 99) throw new OrderError("Invalid custom item.");
-          return { lineId, productId: null, name: it.custom.name.trim().slice(0, 80), custom: true, categoryId: null, categoryName: "Custom", qty, unitPrice: price, variants: [], addons: [], notes: (it.notes ?? "").slice(0, 300), lineTotal: price * qty };
-        }
-        const product = it.productId ? prodMap.get(it.productId) : undefined;
-        if (!product) throw new OrderError("One of the items is no longer on the menu.", "PRODUCT_UNAVAILABLE", 409);
-        const p = priceLine(product, groupMap, addonMap, { qty: it.qty, variants: it.variants, addonIds: it.addonIds, notes: it.notes });
-        return { lineId, ...p, custom: false, categoryName: p.categoryId ? (catName.get(p.categoryId) ?? "") : "" };
-      });
-      const subtotal = lines.reduce((s, l) => s + l.lineTotal, 0);
+  /* catalogue — always loaded from Firestore under THIS tenant; ids supplied by the client that do not exist here are rejected */
+  const productIds = Array.from(new Set(input.items.map((i) => i.productId).filter((x): x is string => !!x)));
+  const prods = await T.products.getMany(productIds);
+  const prodMap = new Map(prods.map((p) => [p.id, p]));
+  const groups = await T.variantGroups.getMany(prods.flatMap((p) => p.variantGroupIds));
+  const groupMap = new Map<string, VariantGroupLike>(groups.map((g) => [g.id, g]));
+  const adds = await T.addons.getMany(prods.flatMap((p) => p.addonIds));
+  const addonMap = new Map<string, AddonLike>(adds.map((a) => [a.id, a]));
+  const cats = await T.categories.getMany(prods.map((p) => p.categoryId).filter((x): x is string => !!x));
+  const catName = new Map(cats.map((c) => [c.id, c.name]));
 
-      // customer
-      const phone = normalizePhone(input.customer?.phone ?? "");
-      const email = (input.customer?.email ?? "").trim().toLowerCase();
-      const customerKey = phone || email;
+  const lines: OrderLine[] = input.items.map((it) => {
+    const lineId = crypto.randomUUID();
+    if (it.custom) {
+      if (!staff) throw new OrderError("Custom items can only be added by staff.", "FORBIDDEN", 403);
+      const price = Math.round(it.custom.price);
+      const qty = Math.floor(it.qty);
+      if (!it.custom.name.trim() || price < 0 || qty < 1 || qty > 99) throw new OrderError("Invalid custom item.");
+      return { lineId, productId: null, name: it.custom.name.trim().slice(0, 80), custom: true, categoryId: null, categoryName: "Custom", qty, unitPrice: price, variants: [], addons: [], notes: (it.notes ?? "").slice(0, 300), lineTotal: price * qty };
+    }
+    const product = it.productId ? prodMap.get(it.productId) : undefined;
+    if (!product) throw new OrderError("One of the items is no longer on the menu.", "PRODUCT_UNAVAILABLE", 409);
+    const p = priceLine(product, groupMap, addonMap, { qty: it.qty, variants: it.variants, addonIds: it.addonIds, notes: it.notes });
+    return { lineId, ...p, custom: false, categoryName: p.categoryId ? (catName.get(p.categoryId) ?? "") : "" };
+  });
+  const subtotal = lines.reduce((s, l) => s + l.lineTotal, 0);
 
-      // coupon
-      let couponId: string | null = null;
-      let couponCode = "";
-      let couponDiscount = 0;
-      if (input.couponCode?.trim()) {
-        const code = input.couponCode.trim().toUpperCase();
-        const c = (await tx.select().from(coupons).where(and(eq(coupons.restaurantId, rest.id), eq(coupons.code, code))).limit(1))[0];
-        let used = 0;
-        if (c && customerKey) {
-          used = (await tx.select({ n: sql<number>`count(*)::int` }).from(couponRedemptions).where(and(eq(couponRedemptions.couponId, c.id), eq(couponRedemptions.customerKey, customerKey))))[0].n;
-        }
-        const res = validateCoupon(c, { lines, subtotal, customerRedemptions: used });
-        if (!res.ok) throw new OrderError(res.reason, "COUPON_INVALID");
-        if (c!.perCustomerLimit > 0 && !customerKey) throw new OrderError("Enter your phone number to use this coupon.", "COUPON_NEEDS_CUSTOMER");
-        couponId = c!.id;
-        couponCode = c!.code;
-        couponDiscount = res.discount;
-      }
+  const phone = normalizePhone(input.customer?.phone ?? "");
+  const email = (input.customer?.email ?? "").trim().toLowerCase();
+  const customerKey = phone || email;
+  const customerId = customerKey ? customerIdFor(customerKey) : null;
+  const customerName = input.customer?.name?.trim().slice(0, 80) ?? "";
+  const couponCode = input.couponCode?.trim().toUpperCase() ?? "";
 
-      // fees & totals (never from client)
-      const fee = calculatePlatformFee({ mode: settings.fees.mode, amountMinor: settings.fees.amountMinor, eligible: input.source === "QR" });
-      const manual = staff ? Math.max(0, Math.round(input.manualDiscount ?? 0)) : 0;
-      const totals = calculateTotals({ subtotal, couponDiscount, manualDiscount: manual, tax: settings.tax, customerFee: fee.customerFee });
+  const orderId = input.idempotencyKey ? orderIdForKey(input.restaurantId, input.idempotencyKey) : T.orders.newId();
 
-      // sequence + id
-      const seq = (await tx.update(restaurants).set({ orderSeq: sql`${restaurants.orderSeq} + 1` }).where(eq(restaurants.id, rest.id)).returning({ s: restaurants.orderSeq }))[0].s;
-      const displayId = formatOrderId(settings.orderPrefix, seq);
-      const status = initialOrderStatus(input.source, settings.paymentTiming);
-
-      // customer upsert
-      let customerId: string | null = null;
-      if (customerKey) {
-        const up = await tx
-          .insert(customers)
-          .values({ restaurantId: rest.id, phone, email, name: input.customer?.name?.trim().slice(0, 80) ?? "" })
-          .onConflictDoUpdate({ target: [customers.restaurantId, customers.phone, customers.email], set: { name: sql`case when excluded.name <> '' then excluded.name else ${customers.name} end` } })
-          .returning({ id: customers.id });
-        customerId = up[0].id;
-      }
-
-      const [order] = await tx
-        .insert(orders)
-        .values({
-          restaurantId: rest.id,
-          displayId,
-          publicToken: crypto.randomBytes(18).toString("hex"),
-          idempotencyKey: input.idempotencyKey ?? null,
-          source: input.source,
-          status,
-          paymentStatus: "PENDING",
-          tableId: table?.id ?? null,
-          tableName: table?.name ?? "",
-          customerId,
-          customerName: input.customer?.name?.trim().slice(0, 80) ?? "",
-          customerPhone: phone,
-          customerEmail: email,
-          items: lines,
-          customerNotes: staff ? "" : (input.notes ?? "").slice(0, 500),
-          staffNotes: staff ? (input.notes ?? input.staffNotes ?? "").slice(0, 500) : "",
-          couponId,
-          couponCode,
-          subtotal: totals.subtotal,
-          discount: totals.discount,
-          manualDiscount: totals.manualDiscount,
-          tax: totals.tax,
-          taxLabel: settings.tax.enabled ? `${settings.tax.name} ${settings.tax.ratePct}%` : "",
-          platformFee: totals.platformFee,
-          total: totals.total,
-          paymentTiming: settings.paymentTiming,
-          createdBy: input.createdBy ?? null,
-        })
-        .returning();
-
-      if (couponId) {
-        const upd = await tx
-          .update(coupons)
-          .set({ usageCount: sql`${coupons.usageCount} + 1` })
-          .where(and(eq(coupons.id, couponId), sql`(${coupons.usageLimit} = 0 or ${coupons.usageCount} < ${coupons.usageLimit})`))
-          .returning({ id: coupons.id });
-        if (!upd.length) throw new OrderError("This coupon has reached its usage limit", "COUPON_INVALID");
-        await tx.insert(couponRedemptions).values({ restaurantId: rest.id, couponId, orderId: order.id, customerKey });
-      }
-      if (fee.ledgerAmount > 0) {
-        await tx.insert(usageLedger).values({ restaurantId: rest.id, orderId: order.id, orderDisplayId: displayId, amount: fee.ledgerAmount, mode: settings.fees.mode });
-      }
-      if (table) await tx.update(diningTables).set({ status: "OCCUPIED", updatedAt: new Date() }).where(eq(diningTables.id, table.id));
-
-      let current = order;
-      if (input.payment && staff) current = await recordPayment(tx, current, { method: input.payment.method, reference: input.payment.reference, actorId: input.createdBy ?? null, settings });
-      if (status === settings.inventoryDeductOn) await deductInventory(tx, current, input.createdBy ?? null, settings);
-
-      if (input.source === "QR") await notify(rest.id, "ORDER_RECEIVED", `New order ${displayId}`, table ? `Table ${table.name}` : "Online order", `order:${order.id}:received`, tx);
-      if (input.dryRun) throw new DryRun(current);
-      return { order: current, existing: false };
-    });
-  } catch (e) {
-    if (e instanceof DryRun) return { order: e.order, existing: false };
-    const err = e as { code?: string; cause?: { code?: string } };
-    if ((err?.cause?.code ?? err?.code) === "23505" && input.idempotencyKey) {
-      const ex = (await db.select().from(orders).where(and(eq(orders.restaurantId, input.restaurantId), eq(orders.idempotencyKey, input.idempotencyKey))).limit(1))[0];
+  return R.transaction(async (tx) => {
+    /* ---------------- reads ---------------- */
+    if (input.idempotencyKey) {
+      const ex = await T.orders.get(orderId, tx);
       if (ex) return { order: ex, existing: true };
     }
-    throw e;
-  }
+    const counters = await T.usage.getCounters(tx);
+    if (!staff && settings.fees.blockOnThreshold && counters.usageBalance >= settings.fees.thresholdMinor) {
+      throw new OrderError("This restaurant cannot accept new online orders right now. Please order at the counter.", "USAGE_BLOCKED", 403);
+    }
+    const coupon = couponCode ? await T.coupons.get(couponCode, tx) : null;
+    const used = coupon ? await T.coupons.countRedemptionsForCustomer(coupon.id, customerKey, tx) : 0;
+    const customer = customerId ? await T.customers.get(customerId, tx) : null;
+    const liveTable = table ? await T.tables.get(table.id, tx) : null;
+    if (table && !liveTable) throw new OrderError("Table not found.", "TABLE_INVALID", 404);
+
+    /* ---------------- compute (all trusted, server side) ---------------- */
+    let couponDiscount = 0;
+    let appliedCouponId: string | null = null;
+    if (couponCode) {
+      const res = validateCoupon(coupon, { lines, subtotal, customerRedemptions: used });
+      if (!res.ok) throw new OrderError(res.reason, "COUPON_INVALID");
+      if (coupon!.perCustomerLimit > 0 && !customerKey) throw new OrderError("Enter your phone number to use this coupon.", "COUPON_NEEDS_CUSTOMER");
+      appliedCouponId = coupon!.id;
+      couponDiscount = res.discount;
+    }
+    const fee = calculatePlatformFee({ mode: settings.fees.mode, amountMinor: settings.fees.amountMinor, eligible: input.source === "QR" });
+    const manual = staff ? Math.max(0, Math.round(input.manualDiscount ?? 0)) : 0;
+    const totals = calculateTotals({ subtotal, couponDiscount, manualDiscount: manual, tax: settings.tax, customerFee: fee.customerFee });
+    const seq = counters.orderSeq + 1;
+    const displayId = formatOrderId(settings.orderPrefix, seq);
+    const status = initialOrderStatus(input.source, settings.paymentTiming);
+    const now = new Date();
+
+    const order: Order = {
+      id: orderId,
+      restaurantId: input.restaurantId,
+      displayId,
+      publicToken: publicToken(),
+      idempotencyKey: input.idempotencyKey ?? null,
+      source: input.source,
+      status,
+      paymentStatus: "PENDING",
+      paymentMethod: "",
+      tableId: table?.id ?? null,
+      tableName: table?.name ?? "",
+      customerId,
+      customerName,
+      customerPhone: phone,
+      customerEmail: email,
+      items: lines,
+      customerNotes: staff ? "" : (input.notes ?? "").slice(0, 500),
+      staffNotes: staff ? (input.notes ?? input.staffNotes ?? "").slice(0, 500) : "",
+      kitchenNotes: "",
+      couponId: appliedCouponId,
+      couponCode: appliedCouponId ? coupon!.code : "",
+      subtotal: totals.subtotal,
+      discount: totals.discount,
+      manualDiscount: totals.manualDiscount,
+      tax: totals.tax,
+      taxLabel: settings.tax.enabled ? `${settings.tax.name} ${settings.tax.ratePct}%` : "",
+      platformFee: totals.platformFee,
+      total: totals.total,
+      paymentTiming: settings.paymentTiming,
+      inventoryProcessed: false,
+      loyaltyProcessed: false,
+      createdBy: input.createdBy ?? null,
+      createdAt: now,
+      updatedAt: now,
+      completedAt: null,
+    };
+
+    const writers: Writer[] = [];
+    if (input.payment && staff) writers.push(planPayment(T, order, { method: input.payment.method, reference: input.payment.reference, actorId: input.createdBy ?? null, settings }, tx));
+    if (status === settings.inventoryDeductOn) writers.push(await planDeduction(tx, T, order, input.createdBy ?? null, settings));
+
+    if (input.dryRun) return { order, existing: false };
+
+    /* ---------------- writes ---------------- */
+    writers.forEach((w) => w());
+    T.usage.setCounters({ orderSeq: seq, usageBalance: counters.usageBalance + fee.ledgerAmount, usageOrders: counters.usageOrders + (fee.ledgerAmount > 0 ? 1 : 0) }, tx);
+    if (fee.ledgerAmount > 0) {
+      await T.usage.create(orderId, { orderId, orderDisplayId: displayId, amount: fee.ledgerAmount, mode: settings.fees.mode, status: "CHARGED", settlementId: null, createdAt: now }, tx);
+    }
+    if (appliedCouponId && coupon) {
+      await T.coupons.update(coupon.id, { usageCount: coupon.usageCount + 1, updatedAt: now }, tx);
+      T.coupons.addRedemption(coupon.id, orderId, customerKey, tx);
+    }
+    if (customerId) {
+      if (customer) {
+        if (customerName) await T.customers.update(customerId, { name: customerName }, tx);
+      } else await T.customers.create(customerId, { phone, email, name: customerName, orders: 0, totalSpend: 0, visits: 0, lastOrderAt: null, createdAt: now }, tx);
+    }
+    if (liveTable) await T.tables.update(liveTable.id, { status: "OCCUPIED", updatedAt: now }, tx);
+    if (input.source === "QR") await T.notifications.push(`order:${orderId}:received`, { type: "ORDER_RECEIVED", title: `New order ${displayId}`, body: table ? `Table ${table.name}` : "Online order" }, tx);
+    await T.orders.save(order, tx);
+    return { order, existing: false };
+  });
 }
 
-/* ----------------------------- payments ----------------------------- */
-export async function recordPayment(
-  tx: DbTx,
+/* ================================== payments ================================== */
+/**
+ * Plans a payment write (no reads required). Only CASH and manual UPI confirmation are recorded here;
+ * a UPI QR / deep link is NOT proof of payment, so staff must explicitly confirm receipt. Online payments are
+ * only ever completed by the provider webhook (see services/payments.ts).
+ */
+export function planPayment(
+  T: TenantRepositories,
   order: Order,
-  o: { method: "CASH" | "UPI" | "ONLINE"; reference?: string; actorId: string | null; settings: Settings },
-): Promise<Order> {
+  o: { method: "CASH" | "UPI"; reference?: string; actorId: string | null; settings: Settings },
+  tx: Tx,
+): Writer {
   if (order.status === "CANCELLED") throw new OrderError("This order was cancelled.", "ORDER_CANCELLED", 409);
   if (order.paymentStatus === "SUCCESS") throw new OrderError("This order is already paid.", "ALREADY_PAID", 409);
-  const allowed = o.method === "CASH" ? o.settings.payments.cash : o.method === "UPI" ? o.settings.payments.upi : o.settings.payments.online;
+  const allowed = o.method === "CASH" ? o.settings.payments.cash : o.settings.payments.upi;
   if (!allowed) throw new OrderError(`${o.method} payments are not enabled for this restaurant.`, "METHOD_DISABLED", 400);
-  await tx.insert(payments).values({ restaurantId: order.restaurantId, orderId: order.id, method: o.method, status: "SUCCESS", amount: order.total, reference: (o.reference ?? "").slice(0, 80), recordedBy: o.actorId });
-  const nextStatus = order.status === "PAYMENT_PENDING" ? "PAYMENT_COMPLETED" : order.status;
-  const [u] = await tx.update(orders).set({ paymentStatus: "SUCCESS", paymentMethod: o.method, status: nextStatus, updatedAt: new Date() }).where(eq(orders.id, order.id)).returning();
-  await tx.insert(bills).values({ restaurantId: order.restaurantId, orderId: order.id }).onConflictDoNothing();
-  await notify(order.restaurantId, "PAYMENT_SUCCESS", `Payment received for ${order.displayId}`, `${o.method} · ${(order.total / 100).toFixed(2)}`, `order:${order.id}:paid`, tx);
-  return u;
-}
-
-/* ----------------------------- inventory ----------------------------- */
-export async function deductInventory(tx: DbTx, order: Order, actorId: string | null, settings: Settings) {
-  if (order.inventoryProcessed) return;
-  const lines = order.items as OrderLine[];
-  const pids = Array.from(new Set(lines.map((l) => l.productId).filter((x): x is string => !!x)));
-  const recipeRows = pids.length ? await tx.select().from(recipes).where(and(eq(recipes.restaurantId, order.restaurantId), inArray(recipes.productId, pids))) : [];
-  const recipeMap = new Map(recipeRows.map((r) => [r.productId, r.items]));
-  const needs = computeDeductions(lines, recipeMap);
-  const ids = Array.from(needs.keys()).sort(); // stable lock order
-  for (const ingId of ids) {
-    const qty = needs.get(ingId)!;
-    const ing = (await tx.execute(sql`select id, name, current_stock, low_stock_threshold from ingredients where id = ${ingId} and restaurant_id = ${order.restaurantId} for update`)).rows[0] as
-      | { id: string; name: string; current_stock: number; low_stock_threshold: number }
-      | undefined;
-    if (!ing) continue;
-    const before = Number(ing.current_stock);
-    if (before < qty && !settings.allowNegativeStock) throw new OrderError(`Not enough ${ing.name} in stock (need ${qty}, have ${before}). Adjust inventory first.`, "INSUFFICIENT_STOCK", 409);
-    const after = before - qty;
-    const ins = await tx
-      .insert(inventoryTransactions)
-      .values({ restaurantId: order.restaurantId, ingredientId: ingId, orderId: order.id, type: "ORDER_DEDUCTION", quantityBefore: before, quantityUsed: qty, quantityAfter: after, actorId, note: order.displayId })
-      .onConflictDoNothing()
-      .returning({ id: inventoryTransactions.id });
-    if (!ins.length) continue; // already deducted (idempotent)
-    await tx.update(ingredients).set({ currentStock: after, updatedAt: new Date() }).where(eq(ingredients.id, ingId));
-    if (after <= Number(ing.low_stock_threshold)) {
-      await notify(order.restaurantId, "LOW_STOCK", `Low stock: ${ing.name}`, `${after} left (threshold ${ing.low_stock_threshold})`, `low:${ingId}`, tx);
-    }
-  }
-  await tx.update(orders).set({ inventoryProcessed: true }).where(eq(orders.id, order.id));
-  order.inventoryProcessed = true;
-}
-
-/* ---------------------------- completion ---------------------------- */
-async function onCompleted(tx: DbTx, order: Order) {
-  if (order.loyaltyProcessed) return;
-  const flag = await tx.update(orders).set({ loyaltyProcessed: true }).where(and(eq(orders.id, order.id), eq(orders.loyaltyProcessed, false))).returning({ id: orders.id });
-  if (!flag.length) return;
-  if (order.customerId) {
-    const c = (await tx.execute(sql`select visits from customers where id = ${order.customerId} for update`)).rows[0] as { visits: number } | undefined;
-    const prog = (await tx.select().from(loyaltyPrograms).where(eq(loyaltyPrograms.restaurantId, order.restaurantId)).limit(1))[0];
-    const prev = c?.visits ?? 0;
-    const ev = evaluateVisit(prev, prog?.requiredVisits ?? 5);
-    await tx
-      .update(customers)
-      .set({ orders: sql`${customers.orders} + 1`, totalSpend: sql`${customers.totalSpend} + ${order.total}`, visits: ev.visits, lastOrderAt: new Date() })
-      .where(eq(customers.id, order.customerId));
-    if (prog?.isActive && ev.unlockMilestone) {
-      const r = await tx
-        .insert(loyaltyRewards)
-        .values({ restaurantId: order.restaurantId, customerId: order.customerId, milestone: ev.unlockMilestone, title: prog.rewardTitle })
-        .onConflictDoNothing()
-        .returning({ id: loyaltyRewards.id });
-      if (r.length) await notify(order.restaurantId, "LOYALTY_UNLOCKED", "Loyalty reward unlocked", `${order.customerName || order.customerPhone || "A customer"} earned: ${prog.rewardTitle}`, `loyalty:${r[0].id}`, tx);
-    }
-  }
   const now = new Date();
-  const camp = (
-    await tx
-      .select()
-      .from(scratchCampaigns)
-      .where(and(eq(scratchCampaigns.restaurantId, order.restaurantId), eq(scratchCampaigns.isActive, true), sql`(${scratchCampaigns.startsAt} is null or ${scratchCampaigns.startsAt} <= ${now})`, sql`(${scratchCampaigns.endsAt} is null or ${scratchCampaigns.endsAt} >= ${now})`, sql`(${scratchCampaigns.usageLimit} = 0 or ${scratchCampaigns.usedCount} < ${scratchCampaigns.usageLimit})`))
-      .limit(1)
-  )[0];
-  if (camp) await tx.insert(scratchIssuances).values({ restaurantId: order.restaurantId, campaignId: camp.id, orderId: order.id }).onConflictDoNothing();
+  const nextStatus = order.status === "PAYMENT_PENDING" ? "PAYMENT_COMPLETED" : order.status;
+  // reflect immediately so later planners see the post-payment state
+  order.paymentStatus = "SUCCESS";
+  order.paymentMethod = o.method;
+  order.status = nextStatus;
+  order.updatedAt = now;
+  return () => {
+    void T.payments.create(null, { orderId: order.id, method: o.method, status: "SUCCESS", amount: order.total, reference: (o.reference ?? "").slice(0, 80), provider: o.method, providerRef: "", recordedBy: o.actorId, createdAt: now, updatedAt: now }, tx);
+    void T.bills.set(order.id, { orderId: order.id, emailedTo: "", emailedAt: null, createdAt: now }, tx);
+    void T.notifications.push(`order:${order.id}:paid`, { type: "PAYMENT_SUCCESS", title: `Payment received for ${order.displayId}`, body: `${o.method} · ${(order.total / 100).toFixed(2)}` }, tx);
+  };
 }
 
-/* --------------------------- state transitions --------------------------- */
+export async function collectPayment(restaurantId: string, orderId: string, method: "CASH" | "UPI", actorId: string | null, reference?: string) {
+  const R = repos();
+  const T = R.tenant(restaurantId);
+  return R.transaction(async (tx) => {
+    const order = await T.orders.get(orderId, tx);
+    if (!order) throw new OrderError("Order not found.", "NOT_FOUND", 404);
+    const rest = await R.restaurants.get(restaurantId, tx);
+    planPayment(T, order, { method, reference, actorId, settings: resolveSettings(rest?.settings) }, tx)();
+    await T.orders.save(order, tx);
+    return order;
+  });
+}
+
+/* ================================== inventory ================================== */
+/**
+ * Plans an idempotent inventory deduction. Reads happen now (inside the transaction); the returned writer
+ * performs the writes. A deduction can never be applied twice: (1) `order.inventoryProcessed`,
+ * (2) a deterministic ledger id per (order, ingredient) that is created, never overwritten.
+ */
+export async function planDeduction(tx: Tx, T: TenantRepositories, order: Order, actorId: string | null, settings: Settings): Promise<Writer> {
+  if (order.inventoryProcessed) return noop;
+  const pids = Array.from(new Set(order.items.map((l) => l.productId).filter((x): x is string => !!x)));
+  const recipeRows = await T.recipes.getMany(pids, tx);
+  const needs = computeDeductions(order.items, new Map(recipeRows.map((r) => [r.productId, r.items])));
+  const ids = Array.from(needs.keys()).sort();
+  const ings = new Map((await T.ingredients.getMany(ids, tx)).map((i) => [i.id, i]));
+  const already = new Set((await T.inventoryTransactions.getMany(ids.map((i) => deductionTxId(order.id, i)), tx)).map((t) => t.ingredientId));
+  const steps: { id: string; name: string; before: number; qty: number; after: number; threshold: number }[] = [];
+  for (const ingId of ids) {
+    const ing = ings.get(ingId);
+    if (!ing || already.has(ingId)) continue;
+    const qty = needs.get(ingId)!;
+    if (ing.currentStock < qty && !settings.allowNegativeStock) {
+      throw new OrderError(`Not enough ${ing.name} in stock (need ${qty}, have ${ing.currentStock}). Adjust inventory first.`, "INSUFFICIENT_STOCK", 409);
+    }
+    steps.push({ id: ingId, name: ing.name, before: ing.currentStock, qty, after: ing.currentStock - qty, threshold: ing.lowStockThreshold });
+  }
+  order.inventoryProcessed = true;
+  return () => {
+    const now = new Date();
+    for (const s of steps) {
+      void T.inventoryTransactions.create(deductionTxId(order.id, s.id), { ingredientId: s.id, orderId: order.id, type: "ORDER_DEDUCTION", quantityBefore: s.before, quantityUsed: s.qty, quantityAfter: s.after, note: order.displayId, actorId, createdAt: now }, tx);
+      void T.ingredients.update(s.id, { currentStock: s.after, updatedAt: now }, tx);
+      if (s.after <= s.threshold) void T.notifications.push(`low:${s.id}`, { type: "LOW_STOCK", title: `Low stock: ${s.name}`, body: `${s.after} left (threshold ${s.threshold})` }, tx);
+    }
+  };
+}
+
+/* ================================== completion ================================== */
+/** Loyalty visit + scratch card issuance. Runs once per order (`loyaltyProcessed`) and uses deterministic ids. */
+export async function planCompletion(tx: Tx, T: TenantRepositories, order: Order): Promise<Writer> {
+  if (order.loyaltyProcessed) return noop;
+  const customer = order.customerId ? await T.customers.get(order.customerId, tx) : null;
+  const prog = await T.loyalty.getProgramTx(tx);
+  const ev = evaluateVisit(customer?.visits ?? 0, prog?.requiredVisits ?? 5);
+  const rewardId = order.customerId && ev.unlockMilestone ? T.loyalty.rewardId(order.customerId, ev.unlockMilestone) : null;
+  const existingReward = rewardId ? await T.loyalty.get(rewardId, tx) : null;
+  const now = new Date();
+  const campaigns = (await T.scratchCampaigns.list({ where: [["isActive", "==", true]] }, tx))
+    .filter((c) => (!c.startsAt || c.startsAt <= now) && (!c.endsAt || c.endsAt >= now) && (c.usageLimit === 0 || c.usedCount < c.usageLimit))
+    .sort((a, b) => +a.createdAt - +b.createdAt);
+  const existingCard = await T.scratchCards.get(order.id, tx);
+  order.loyaltyProcessed = true;
+  return () => {
+    if (customer && order.customerId) {
+      void T.customers.update(order.customerId, { orders: customer.orders + 1, totalSpend: customer.totalSpend + order.total, visits: ev.visits, lastOrderAt: now }, tx);
+      if (prog?.isActive && rewardId && ev.unlockMilestone && !existingReward) {
+        void T.loyalty.create(rewardId, { customerId: order.customerId, milestone: ev.unlockMilestone, title: prog.rewardTitle, status: "UNLOCKED", code: "", createdAt: now, claimedAt: null }, tx);
+        void T.notifications.push(`loyalty:${rewardId}`, { type: "LOYALTY_UNLOCKED", title: "Loyalty reward unlocked", body: `${order.customerName || order.customerPhone || "A customer"} earned: ${prog.rewardTitle}` }, tx);
+      }
+    }
+    if (campaigns[0] && !existingCard) {
+      void T.scratchCards.create(order.id, { campaignId: campaigns[0].id, orderId: order.id, status: "ISSUED", reward: "", code: "", createdAt: now }, tx);
+    }
+  };
+}
+
+/* ============================ state transitions ============================ */
 export async function transitionOrder(restaurantId: string, orderId: string, action: OrderAction, actorId: string | null): Promise<Order> {
   const to = ORDER_ACTIONS[action].to;
-  return db.transaction(async (tx) => {
-    const locked = (await tx.execute(sql`select id from orders where id = ${orderId} and restaurant_id = ${restaurantId} for update`)).rows[0];
-    if (!locked) throw new OrderError("Order not found.", "NOT_FOUND", 404);
-    const order = (await tx.select().from(orders).where(eq(orders.id, orderId)).limit(1))[0];
+  const R = repos();
+  const T = R.tenant(restaurantId);
+  return R.transaction(async (tx) => {
+    const order = await T.orders.get(orderId, tx);
+    if (!order) throw new OrderError("Order not found.", "NOT_FOUND", 404);
     if (order.status === to) return order; // idempotent re-click
     if (!canTransition(order.status, to)) throw new OrderError(`An order that is ${order.status.toLowerCase().replace("_", " ")} cannot be moved to ${to.toLowerCase()}.`, "INVALID_TRANSITION", 409);
     if (to === "CONFIRMED" && order.paymentTiming === "PAY_FIRST" && order.paymentStatus !== "SUCCESS" && order.source === "QR") {
       throw new OrderError("This order must be paid before it can be confirmed.", "PAYMENT_REQUIRED", 409);
     }
     if (to === "COMPLETED" && order.paymentStatus !== "SUCCESS") throw new OrderError("Collect payment before completing the order.", "PAYMENT_REQUIRED", 409);
-    const rest = (await tx.select().from(restaurants).where(eq(restaurants.id, restaurantId)).limit(1))[0];
-    const settings = resolveSettings(rest.settings);
 
-    const [u] = await tx
-      .update(orders)
-      .set({ status: to, updatedAt: new Date(), ...(to === "COMPLETED" ? { completedAt: new Date() } : {}) })
-      .where(eq(orders.id, orderId))
-      .returning();
+    /* ---------------- reads ---------------- */
+    const rest = await R.restaurants.get(restaurantId, tx);
+    const settings = resolveSettings(rest?.settings);
+    const now = new Date();
+    const u: Order = { ...order, status: to, updatedAt: now, completedAt: to === "COMPLETED" ? now : order.completedAt };
+    const writers: Writer[] = [];
 
-    if (to === settings.inventoryDeductOn || to === "COMPLETED") await deductInventory(tx, u, actorId, settings);
+    if (to === settings.inventoryDeductOn || to === "COMPLETED") writers.push(await planDeduction(tx, T, u, actorId, settings));
+    if (to === "COMPLETED") writers.push(await planCompletion(tx, T, u));
 
     if (to === "CANCELLED") {
-      await tx.update(usageLedger).set({ status: "VOID" }).where(and(eq(usageLedger.orderId, orderId), eq(usageLedger.status, "CHARGED")));
-      if (order.couponId) {
-        const del = await tx.delete(couponRedemptions).where(and(eq(couponRedemptions.orderId, orderId))).returning({ id: couponRedemptions.id });
-        if (del.length) await tx.update(coupons).set({ usageCount: sql`greatest(${coupons.usageCount} - 1, 0)` }).where(eq(coupons.id, order.couponId));
-      }
-      if (order.paymentStatus === "SUCCESS") {
-        await tx.update(orders).set({ paymentStatus: "REFUNDED" }).where(eq(orders.id, orderId));
-        await tx.update(payments).set({ status: "REFUNDED" }).where(eq(payments.orderId, orderId));
-      } else if (order.paymentStatus === "PENDING") {
-        await tx.update(orders).set({ paymentStatus: "CANCELLED" }).where(eq(orders.id, orderId));
-      }
+      const usage = await T.usage.get(orderId, tx);
+      const counters = await T.usage.getCounters(tx);
+      const coupon = order.couponId ? await T.coupons.get(order.couponId, tx) : null;
+      const redemption = order.couponId ? await T.coupons.getRedemption(order.couponId, orderId, tx) : null;
+      const pays = await T.payments.list({ where: [["orderId", "==", orderId]] }, tx);
+      const wasPaid = order.paymentStatus === "SUCCESS";
+      if (wasPaid) u.paymentStatus = "REFUNDED";
+      else if (order.paymentStatus === "PENDING" || order.paymentStatus === "PROCESSING") u.paymentStatus = "CANCELLED";
+      writers.push(() => {
+        if (usage && usage.status === "CHARGED") {
+          void T.usage.update(orderId, { status: "VOID" }, tx);
+          void T.usage.setCounters({ ...counters, usageBalance: Math.max(0, counters.usageBalance - usage.amount), usageOrders: Math.max(0, counters.usageOrders - 1) }, tx);
+        }
+        if (coupon && redemption) {
+          T.coupons.removeRedemption(coupon.id, orderId, tx);
+          void T.coupons.update(coupon.id, { usageCount: Math.max(0, coupon.usageCount - 1), updatedAt: now }, tx);
+        }
+        for (const p of pays) {
+          if (p.status === "SUCCESS") void T.payments.update(p.id, { status: "REFUNDED", updatedAt: now }, tx);
+          else if (p.status === "PENDING" || p.status === "PROCESSING") void T.payments.update(p.id, { status: "CANCELLED", updatedAt: now }, tx);
+        }
+      });
     }
-    if (to === "CONFIRMED") await notify(restaurantId, "ORDER_CONFIRMED", `Order ${order.displayId} confirmed`, "", `order:${orderId}:confirmed`, tx);
-    if (to === "READY") await notify(restaurantId, "ORDER_READY", `Order ${order.displayId} is ready`, order.tableName ? `Table ${order.tableName}` : "", `order:${orderId}:ready`, tx);
-    if (to === "COMPLETED") await onCompleted(tx, u);
-    if ((to === "COMPLETED" || to === "CANCELLED") && order.tableId) {
-      const open = await tx
-        .select({ n: sql<number>`count(*)::int` })
-        .from(orders)
-        .where(and(eq(orders.tableId, order.tableId), sql`${orders.status} not in ('COMPLETED','CANCELLED')`));
-      if (open[0].n === 0) await tx.update(diningTables).set({ status: "FREE", updatedAt: new Date() }).where(eq(diningTables.id, order.tableId));
-    }
-    return (await tx.select().from(orders).where(eq(orders.id, orderId)).limit(1))[0];
-  });
-}
 
-export async function collectPayment(restaurantId: string, orderId: string, method: "CASH" | "UPI" | "ONLINE", actorId: string | null, reference?: string) {
-  return db.transaction(async (tx) => {
-    const locked = (await tx.execute(sql`select id from orders where id = ${orderId} and restaurant_id = ${restaurantId} for update`)).rows[0];
-    if (!locked) throw new OrderError("Order not found.", "NOT_FOUND", 404);
-    const order = (await tx.select().from(orders).where(eq(orders.id, orderId)).limit(1))[0];
-    const rest = (await tx.select().from(restaurants).where(eq(restaurants.id, restaurantId)).limit(1))[0];
-    return recordPayment(tx, order, { method, reference, actorId, settings: resolveSettings(rest.settings) });
+    if ((to === "COMPLETED" || to === "CANCELLED") && order.tableId) {
+      const siblings = await T.orders.listForTable(order.tableId, tx);
+      const table = await T.tables.get(order.tableId, tx);
+      const open = siblings.filter((o) => o.id !== order.id && !["COMPLETED", "CANCELLED"].includes(o.status)).length;
+      if (table && open === 0) writers.push(() => void T.tables.update(table.id, { status: "FREE", updatedAt: now }, tx));
+    }
+
+    /* ---------------- writes ---------------- */
+    writers.forEach((w) => w());
+    if (to === "CONFIRMED") await T.notifications.push(`order:${orderId}:confirmed`, { type: "ORDER_CONFIRMED", title: `Order ${order.displayId} confirmed` }, tx);
+    if (to === "READY") await T.notifications.push(`order:${orderId}:ready`, { type: "ORDER_READY", title: `Order ${order.displayId} is ready`, body: order.tableName ? `Table ${order.tableName}` : "" }, tx);
+    await T.orders.save(u, tx);
+    return u;
   });
 }

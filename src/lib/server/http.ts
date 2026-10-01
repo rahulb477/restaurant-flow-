@@ -34,10 +34,11 @@ export function errorResponse(e: unknown): Response {
     const i = e.issues[0];
     return Response.json({ error: `${i.path.join(".") || "Input"}: ${i.message}`, code: "VALIDATION" }, { status: 400 });
   }
-  const err = e as { code?: string; cause?: { code?: string }; message?: string };
-  const pg = err?.cause?.code ?? err?.code;
-  if (pg === "23505") return Response.json({ error: "That already exists. Use a different value.", code: "DUPLICATE" }, { status: 409 });
-  if (pg === "22P02") return Response.json({ error: "Invalid identifier supplied.", code: "BAD_ID" }, { status: 400 });
+  const err = e as { code?: string | number; message?: string };
+  // Firestore (gRPC) status codes: 6 = ALREADY_EXISTS, 5 = NOT_FOUND
+  if (err?.code === 6 || err?.code === "already-exists") return Response.json({ error: "That already exists. Use a different value.", code: "DUPLICATE" }, { status: 409 });
+  if (err?.code === 5 && typeof err.message === "string" && err.message.includes("NOT_FOUND")) return Response.json({ error: "Not found", code: "NOT_FOUND" }, { status: 404 });
+  if (typeof err?.code === "string" && err.code.startsWith("auth/")) return Response.json({ error: "Authentication failed. Please sign in again.", code: "UNAUTHENTICATED" }, { status: 401 });
   console.error("[api] unexpected error:", err?.message ?? "unknown");
   return Response.json({ error: "Something went wrong on our side. Please try again.", code: "INTERNAL" }, { status: 500 });
 }

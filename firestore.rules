@@ -1,0 +1,135 @@
+rules_version = '2';
+
+/**
+ * CafePilot Firestore security rules.
+ *
+ * Model
+ *   - Every business document lives under restaurants/{restaurantId}/... and is readable only by an ACTIVE member of that
+ *     restaurant whose role is allowed to see that collection (membership document: restaurants/{rid}/members/{uid}).
+ *   - NO client write is allowed anywhere. All mutations (orders, totals, payments, usage ledger, platform fee,
+ *     inventory history, loyalty / scratch rewards, staff, settings, menu...) go through the Next.js API routes, which use the
+ *     Admin SDK (bypasses these rules), recompute everything server-side and write the audit log. Because the rules grant
+ *     no write at all, a client can never forge a payment status, usage balance, fee record, stock history, reward,
+ *     role, restaurantId or ownerId, nor manage staff.
+ *   - Customers are anonymous. They can only `get` ONE order projection by its unguessable token (no listing) and read
+ *     nothing else. Slugs and QR tokens are resolved server-side.
+ *
+ * Role matrix (mirrors src/lib/permissions.ts)
+ *   OWNER   everything                 MANAGER  all except staff / usage / settings
+ *   CASHIER pos, orders, bills         KITCHEN  kds only (reads kitchenTickets, never prices or customer contact)
+ *   STAFF   pos, orders
+ */
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function memberPath(rid) {
+      return /databases/$(database)/documents/restaurants/$(rid)/members/$(request.auth.uid);
+    }
+    // An ACTIVE membership document is the single source of truth for tenant access (never a token claim,
+    // never a client-supplied value).
+    function isActiveMember(rid) {
+      return signedIn()
+        && exists(memberPath(rid))
+        && get(memberPath(rid)).data.status == 'ACTIVE';
+    }
+    function roleOf(rid) {
+      return get(memberPath(rid)).data.role;
+    }
+    function hasRole(rid, roles) {
+      return isActiveMember(rid) && roleOf(rid) in roles;
+    }
+
+    // ---- role groups ----
+    function ownerOnly(rid)     { return hasRole(rid, ['OWNER']); }
+    function managers(rid)      { return hasRole(rid, ['OWNER', 'MANAGER']); }
+    function orderStaff(rid)    { return hasRole(rid, ['OWNER', 'MANAGER', 'CASHIER', 'STAFF']); }
+    function billingStaff(rid)  { return hasRole(rid, ['OWNER', 'MANAGER', 'CASHIER']); }
+    function kitchenStaff(rid)  { return hasRole(rid, ['OWNER', 'MANAGER', 'KITCHEN']); }
+
+    // ---- global default: deny ----
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ---- users: a person can read their own profile; writes are server-only ----
+    match /users/{uid} {
+      allow get: if signedIn() && request.auth.uid == uid;
+      allow list, write: if false;
+    }
+
+    // ---- server-only lookup tables (slug -> restaurant, QR token -> table) ----
+    match /slugs/{slug} {
+      allow read, write: if false;
+    }
+    match /qrTokens/{token} {
+      allow read, write: if false;
+    }
+
+    // ---- customer order tracking: get-only by unguessable token, never listable, never writable ----
+    match /publicOrders/{token} {
+      allow get: if true;
+      allow list, write: if false;
+    }
+
+    match /restaurants/{rid} {
+      // restaurant profile + settings: any active member. ownerId / restaurantId / role can never be changed by a client.
+      allow get: if isActiveMember(rid);
+      allow list, write: if false;
+
+      match /members/{uid} {
+        allow get: if isActiveMember(rid) && (request.auth.uid == uid || ownerOnly(rid));
+        allow list: if ownerOnly(rid);
+        allow write: if false;
+      }
+      match /staff/{id} {                       // invitations (token hash only)
+        allow read: if ownerOnly(rid);
+        allow write: if false;
+      }
+
+      // ---- menu (also needed by the POS and KDS) ----
+      match /categories/{id}    { allow read: if isActiveMember(rid); allow write: if false; }
+      match /products/{id}      { allow read: if isActiveMember(rid); allow write: if false; }
+      match /variantGroups/{id} { allow read: if isActiveMember(rid); allow write: if false; }
+      match /addons/{id}        { allow read: if isActiveMember(rid); allow write: if false; }
+
+      // ---- inventory ----
+      match /ingredients/{id}   { allow read: if managers(rid); allow write: if false; }
+      match /recipes/{id}       { allow read: if kitchenStaff(rid); allow write: if false; }
+      match /inventoryTransactions/{id} { allow read: if managers(rid); allow write: if false; }   // append-only, server-written
+
+      match /tables/{id}        { allow read: if orderStaff(rid); allow write: if false; }
+
+      // ---- orders & money ----
+      match /orders/{id}        { allow read: if orderStaff(rid); allow write: if false; }
+      match /payments/{id}      { allow read: if billingStaff(rid); allow write: if false; }
+      match /bills/{id}         { allow read: if billingStaff(rid); allow write: if false; }
+      match /customers/{id}     { allow read: if managers(rid); allow write: if false; }          // contains contact details
+
+      // kitchen display: items + notes only (no prices, no customer contact)
+      match /kitchenTickets/{id} { allow read: if kitchenStaff(rid); allow write: if false; }
+
+      // ---- promotions & rewards (rewards are issued by the server only) ----
+      match /coupons/{code} {
+        allow read: if managers(rid);
+        allow write: if false;
+        match /redemptions/{id} { allow read: if managers(rid); allow write: if false; }
+      }
+      match /loyalty/{id}          { allow read: if managers(rid); allow write: if false; }
+      match /scratchCampaigns/{id} { allow read: if managers(rid); allow write: if false; }
+      match /scratchCards/{id}     { allow read: if managers(rid); allow write: if false; }
+      match /reviews/{id}          { allow read: if managers(rid); allow write: if false; }
+
+      // ---- platform usage billing (balance, ledger, settlements): owner reads, server writes ----
+      match /usage/{id}         { allow read: if ownerOnly(rid); allow write: if false; }
+      match /settlements/{id}   { allow read: if ownerOnly(rid); allow write: if false; }
+      match /system/{id}        { allow read: if ownerOnly(rid); allow write: if false; }
+
+      // ---- audit & notifications ----
+      match /activityLogs/{id}  { allow read: if ownerOnly(rid); allow write: if false; }
+      match /notifications/{id} { allow read: if isActiveMember(rid); allow write: if false; }
+    }
+  }
+}

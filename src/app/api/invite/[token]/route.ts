@@ -1,13 +1,18 @@
-import { and, eq, gt } from "drizzle-orm";
-import { db } from "@/db";
-import { invitations, restaurants, users } from "@/db/schema";
-import { api, ApiError } from "@/lib/server/http";
+import { getAdminAuth } from "@/lib/firebase/admin";
+import { api, ApiError, rateLimit, clientIp } from "@/lib/server/http";
 import { sha256 } from "@/lib/server/auth";
+import { repos } from "@/lib/repositories";
+import { parseInviteToken } from "@/lib/server/services/staff";
 
-export const GET = api<{ token: string }>(async (_req, { token }) => {
-  const inv = (await db.select().from(invitations).where(and(eq(invitations.tokenHash, sha256(token)), eq(invitations.status, "PENDING"), gt(invitations.expiresAt, new Date()))).limit(1))[0];
-  if (!inv) throw new ApiError("This invitation is invalid or has expired.", 404, "TOKEN_INVALID");
-  const r = (await db.select({ name: restaurants.name }).from(restaurants).where(eq(restaurants.id, inv.restaurantId)).limit(1))[0];
-  const existing = (await db.select({ id: users.id }).from(users).where(eq(users.email, inv.email)).limit(1)).length > 0;
-  return { email: inv.email, role: inv.role, restaurant: r?.name ?? "", existingAccount: existing };
+export const GET = api<{ token: string }>(async (req, { token }) => {
+  rateLimit(`invinfo:${clientIp(req)}`, 60, 600_000);
+  const parsed = parseInviteToken(token);
+  const invalid = new ApiError("This invitation is invalid or has expired.", 404, "TOKEN_INVALID");
+  if (!parsed) throw invalid;
+  const R = repos();
+  const inv = await R.tenant(parsed.restaurantId).staff.get(parsed.staffId);
+  if (!inv || inv.status !== "PENDING" || inv.expiresAt < new Date() || inv.tokenHash !== sha256(parsed.secret)) throw invalid;
+  const rest = await R.restaurants.get(parsed.restaurantId);
+  const existing = !!(await getAdminAuth().getUserByEmail(inv.email).catch(() => null));
+  return { email: inv.email, role: inv.role, restaurant: rest?.name ?? "", existingAccount: existing };
 });

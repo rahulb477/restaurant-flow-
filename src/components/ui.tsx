@@ -2,7 +2,7 @@
 import { createContext, useCallback, useContext, useEffect, useId, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from "react";
 import { AlertTriangle, CheckCircle2, Inbox, Loader2, Search, X, XCircle, Upload } from "lucide-react";
 import { formatMoney } from "@/lib/calculations";
-import { apiFetch } from "@/lib/client/api";
+import { uploadTenantImage, validateImage, type UploadFolder } from "@/lib/firebase/storage";
 
 export const cx = (...a: (string | false | null | undefined)[]) => a.filter(Boolean).join(" ");
 
@@ -243,23 +243,28 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 }
 
 /* ------------------------------ Uploader ------------------------------ */
-export function ImageUploader({ value, onChange, label = "Image", maxMb = 5 }: { value: string; onChange: (url: string) => void; label?: string; maxMb?: number }) {
+/** Provided by the dashboard shell so uploaders know which tenant folder to write to. */
+export const UploadScope = createContext<string | null>(null);
+
+export function ImageUploader({ value, onChange, label = "Image", maxMb = 5, folder = "products" }: { value: string; onChange: (url: string) => void; label?: string; maxMb?: number; folder?: UploadFolder }) {
+  const rid = useContext(UploadScope);
   const [busy, setBusy] = useState(false);
+  const [pct, setPct] = useState(0);
   const [err, setErr] = useState("");
   const inp = useRef<HTMLInputElement>(null);
   async function pick(f?: File) {
     if (!f) return;
     setErr("");
-    if (!["image/png", "image/jpeg", "image/webp"].includes(f.type)) return setErr("Use a PNG, JPG or WEBP image.");
-    if (f.size > maxMb * 1024 * 1024) return setErr(`Image must be under ${maxMb} MB.`);
+    const problem = validateImage(f, maxMb);
+    if (problem) return setErr(problem);
+    if (!rid) return setErr("Uploads are unavailable outside the dashboard.");
     setBusy(true);
+    setPct(0);
     try {
-      const fd = new FormData();
-      fd.append("file", f);
-      const r = await apiFetch<{ url: string }>("/api/upload", { method: "POST", body: fd });
-      onChange(r.url);
+      onChange(await uploadTenantImage(rid, folder, f, setPct));
     } catch (e) {
-      setErr((e as Error).message);
+      const code = (e as { code?: string }).code ?? "";
+      setErr(code.startsWith("storage/unauthorized") ? "You don’t have permission to upload here." : code === "storage/canceled" ? "Upload cancelled." : (e as Error).message);
     } finally {
       setBusy(false);
     }
@@ -267,10 +272,9 @@ export function ImageUploader({ value, onChange, label = "Image", maxMb = 5 }: {
   return (
     <div>
       <div className="flex items-center gap-3">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
         {value ? <img src={value} alt={label} className="size-16 rounded-lg border border-line object-cover" /> : <div className="grid size-16 place-items-center rounded-lg border border-dashed border-line text-muted"><Upload className="size-5" /></div>}
         <div className="flex gap-2">
-          <Button type="button" size="sm" variant="secondary" loading={busy} onClick={() => inp.current?.click()}>{value ? "Replace" : "Upload"}</Button>
+          <Button type="button" size="sm" variant="secondary" loading={busy} onClick={() => inp.current?.click()}>{busy ? `${pct}%` : value ? "Replace" : "Upload"}</Button>
           {value && <Button type="button" size="sm" variant="ghost" onClick={() => onChange("")}>Remove</Button>}
         </div>
         <input ref={inp} type="file" accept="image/png,image/jpeg,image/webp" className="hidden" onChange={(e) => { pick(e.target.files?.[0]); e.target.value = ""; }} />

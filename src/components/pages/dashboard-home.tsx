@@ -1,6 +1,7 @@
 "use client";
 import Link from "next/link";
 import { AlertTriangle, ChefHat, Boxes, PlusSquare, QrCode, ShoppingCart, ArrowUpRight } from "lucide-react";
+import { useLowStockLive } from "@/lib/client/realtime";
 import { useApi } from "@/lib/client/api";
 import { formatMoney } from "@/lib/calculations";
 import { Card, ChartCard, DataTable, EmptyState, ErrorState, PageHeader, Skeleton, StatCard, StatusBadge, PriceDisplay, Notice } from "../ui";
@@ -19,10 +20,13 @@ export function DashboardHome() {
   const { restaurant } = useShell();
   const cur = restaurant.currency;
   const m = (n: number) => formatMoney(n, cur);
-  const { data, error, loading, reload } = useApi<Data>("/api/dash/dashboard", { poll: 15000 });
+  const { data, error, loading, reload } = useApi<Data>("/api/dash/dashboard", { poll: 30000 });
+  // inventory alerts are realtime; falls back to the API snapshot if the role cannot read ingredients
+  const low = useLowStockLive<Data["lowStock"][number] & { isActive: boolean }>(restaurant.id);
   if (error && !data) return <ErrorState message={error} onRetry={reload} />;
   if (loading || !data) return <div className="space-y-4"><Skeleton className="h-10 w-64" /><div className="grid grid-cols-2 gap-3 md:grid-cols-5">{Array.from({ length: 10 }).map((_, i) => <Skeleton key={i} className="h-24" />)}</div><Skeleton className="h-64" /></div>;
-  const k = data.metrics;
+  const lowList = low.data ? low.data.slice(0, 10) : data.lowStock;
+  const k = { ...data.metrics, lowStock: low.data ? low.data.length : data.metrics.lowStock };
   const a = data.analytics;
   const day = (d: string) => new Date(d + "T00:00:00").toLocaleDateString("en-IN", { day: "numeric", month: "short" });
   const quick = [
@@ -73,8 +77,8 @@ export function DashboardHome() {
         </div>
         <Card className="p-5">
           <h2 className="flex items-center gap-2 font-semibold"><AlertTriangle className="size-4 text-warn" />Low-stock alerts</h2>
-          {!data.lowStock.length ? <p className="mt-4 text-sm text-muted">No low-stock ingredients. 🎉</p> : (
-            <ul className="mt-4 space-y-3">{data.lowStock.map((i) => <li key={i.id} className="flex justify-between text-sm"><span>{i.name}</span><span className="text-bad tabular-nums">{i.currentStock} {i.unit} <span className="text-muted">/ {i.lowStockThreshold}</span></span></li>)}</ul>
+          {!lowList.length ? <p className="mt-4 text-sm text-muted">No low-stock ingredients. 🎉</p> : (
+            <ul className="mt-4 space-y-3">{lowList.map((i) => <li key={i.id} className="flex justify-between text-sm"><span>{i.name}</span><span className="text-bad tabular-nums">{i.currentStock} {i.unit} <span className="text-muted">/ {i.lowStockThreshold}</span></span></li>)}</ul>
           )}
           <Link href="/dashboard/inventory" className="mt-4 inline-block text-sm text-accent">Manage inventory →</Link>
         </Card>

@@ -3,6 +3,7 @@ import { use, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { Check, Copy, ExternalLink, Gift, Sparkles, Star, WifiOff } from "lucide-react";
 import { post, useApi } from "@/lib/client/api";
+import { usePublicOrderLive } from "@/lib/client/realtime";
 import { formatMoney } from "@/lib/calculations";
 import { Button, Card, ErrorState, Notice, Skeleton, StatusBadge, Textarea, cx, useToast } from "@/components/ui";
 import { ItemLines, Timeline, Totals, type OrderRow } from "@/components/order-ui";
@@ -12,6 +13,7 @@ type Data = {
   order: OrderRow;
   restaurant: { name: string; slug: string; logoUrl: string; accent: string; currency: string; googleReviewUrl: string; settings: { payments: { cash: boolean; upi: boolean } } };
   upi: { upiId: string; name: string } | null;
+  onlinePay?: boolean;
   loyalty: { visits: number; required: number; rewardTitle: string; rewards: { id: string; title: string; status: string; code: string }[] } | null;
   scratch: { status: string; reward: string; code: string } | null;
   review: { rating: number; text: string } | null;
@@ -21,7 +23,22 @@ const contrast = (hex: string) => { const n = parseInt(hex.slice(1), 16); return
 
 export default function Page({ params }: { params: Promise<{ token: string }> }) {
   const { token } = use(params);
-  const { data, error, reload } = useApi<Data>(`/api/public/order?token=${token}`, { poll: 4000 });
+  const base = useApi<Data>(`/api/public/order?token=${token}`);
+  const { error, reload } = base;
+  // Firestore listener on the customer-safe order projection: status/payment changes arrive instantly.
+  const live = usePublicOrderLive<{ status: string; paymentStatus: string; paymentMethod: string | null }>(token);
+  const liveKey = live.data ? `${live.data.status}|${live.data.paymentStatus}` : "";
+  const seen = useRef(liveKey);
+  useEffect(() => {
+    if (liveKey && liveKey !== seen.current) { seen.current = liveKey; reload(); }
+  }, [liveKey, reload]);
+  const data = base.data && live.data ? { ...base.data, order: { ...base.data.order, status: live.data.status, paymentStatus: live.data.paymentStatus, paymentMethod: live.data.paymentMethod } } : base.data;
+  const [paying, setPaying] = useState(false);
+  const toast = useToast();
+  async function payOnline() {
+    setPaying(true);
+    try { const r = await post<{ url: string }>("/api/public/pay", { token }); if (r.url) window.location.href = r.url; else toast.error("The payment page could not be opened."); } catch (e) { toast.error((e as Error).message); } finally { setPaying(false); }
+  }
   const [offline, setOffline] = useState(false);
   useEffect(() => {
     const net = (e: Event) => setOffline(!(e as CustomEvent).detail.ok);
@@ -48,6 +65,8 @@ export default function Page({ params }: { params: Promise<{ token: string }> })
         <Card className="p-5">
           <h2 className="font-semibold">Payment</h2>
           {o.paymentTiming === "PAY_FIRST" && o.status === "PAYMENT_PENDING" && <p className="mt-1 text-sm text-warn">Your order will be sent to the kitchen once payment is confirmed.</p>}
+          {data.onlinePay && <Button className="mt-4 w-full" size="lg" loading={paying} onClick={payOnline}>Pay {m(o.total)} online</Button>}
+          {o.paymentStatus === "PROCESSING" && <p className="mt-3 text-sm text-warn">Your online payment is being confirmed. This page will update automatically.</p>}
           {data.upi ? (
             <div className="mt-4"><UpiQr upiId={data.upi.upiId} name={data.upi.name} amountMinor={o.total} orderRef={o.displayId} currency={r.currency} size={180} />
               <p className="mt-3 text-center text-xs text-muted">After paying, staff will confirm receipt and your status will update here.</p></div>

@@ -1,37 +1,35 @@
 import { z } from "zod";
-import { and, desc, eq, gt } from "drizzle-orm";
-import { db } from "@/db";
-import { members, users, invitations } from "@/db/schema";
 import { api, ApiError, readJson } from "@/lib/server/http";
-import { requireCtx, randomToken, sha256 } from "@/lib/server/auth";
+import { requireCtx } from "@/lib/server/auth";
+import { tenantRepos } from "@/lib/repositories";
 import { emailProvider } from "@/lib/server/providers";
 import { logActivity, notify } from "@/lib/server/audit";
+import { newInviteToken } from "@/lib/server/services/staff";
 import { publicEnv } from "@/config/env";
 
 export const GET = api(async () => {
   const ctx = await requireCtx("staff");
-  const active = await db
-    .select({ id: members.id, userId: members.userId, role: members.role, status: members.status, name: users.name, email: users.email, createdAt: members.createdAt })
-    .from(members)
-    .innerJoin(users, eq(users.id, members.userId))
-    .where(eq(members.restaurantId, ctx.restaurantId))
-    .orderBy(members.createdAt);
-  const pending = await db
-    .select({ id: invitations.id, email: invitations.email, role: invitations.role, expiresAt: invitations.expiresAt, emailedAt: invitations.emailedAt })
-    .from(invitations)
-    .where(and(eq(invitations.restaurantId, ctx.restaurantId), eq(invitations.status, "PENDING"), gt(invitations.expiresAt, new Date())))
-    .orderBy(desc(invitations.createdAt));
-  return { members: active, pending, emailConfigured: emailProvider.isConfigured(), selfUserId: ctx.user.id };
+  const T = tenantRepos(ctx.restaurantId);
+  const [members, pending] = await Promise.all([T.members.listAll(), T.staff.listPending(new Date())]);
+  return {
+    members: members.sort((a, b) => +a.createdAt - +b.createdAt).map((m) => ({ id: m.id, userId: m.userId, role: m.role, status: m.status, name: m.name, email: m.email, createdAt: m.createdAt })),
+    pending: pending.map((p) => ({ id: p.id, email: p.email, role: p.role, expiresAt: p.expiresAt, emailedAt: p.emailedAt })),
+    emailConfigured: emailProvider.isConfigured(),
+    selfUserId: ctx.user.id,
+  };
 });
 
 export const POST = api(async (req) => {
   const ctx = await requireCtx("staff");
   const v = z.object({ email: z.string().trim().toLowerCase().email("Enter a valid email"), role: z.enum(["MANAGER", "CASHIER", "KITCHEN", "STAFF"]) }).parse(await readJson(req));
-  const existing = await db.select({ id: members.id }).from(members).innerJoin(users, eq(users.id, members.userId)).where(and(eq(members.restaurantId, ctx.restaurantId), eq(users.email, v.email))).limit(1);
-  if (existing.length) throw new ApiError("That person is already on your team.", 409, "EXISTS");
-  await db.update(invitations).set({ status: "REVOKED" }).where(and(eq(invitations.restaurantId, ctx.restaurantId), eq(invitations.email, v.email), eq(invitations.status, "PENDING")));
-  const token = randomToken();
-  const [inv] = await db.insert(invitations).values({ restaurantId: ctx.restaurantId, email: v.email, role: v.role, tokenHash: sha256(token), expiresAt: new Date(Date.now() + 7 * 86400_000) }).returning();
+  const T = tenantRepos(ctx.restaurantId);
+  const members = await T.members.listAll();
+  if (members.some((m) => m.email.toLowerCase() === v.email)) throw new ApiError("That person is already on your team.", 409, "EXISTS");
+  await T.staff.revokePendingForEmail(v.email);
+  const id = T.staff.newId();
+  const { token, tokenHash } = newInviteToken(ctx.restaurantId, id);
+  const now = new Date();
+  await T.staff.create(id, { restaurantId: ctx.restaurantId, email: v.email, role: v.role, tokenHash, status: "PENDING", expiresAt: new Date(now.getTime() + 7 * 86400_000), emailedAt: null, invitedBy: ctx.user.id, createdAt: now });
   const h = req.headers;
   const host = h.get("x-forwarded-host") ?? h.get("host");
   const proto = h.get("x-forwarded-proto") ?? (host?.startsWith("localhost") ? "http" : "https");
@@ -40,13 +38,13 @@ export const POST = api(async (req) => {
   let emailError: string | null = null;
   try {
     await emailProvider.sendStaffInvitation(v.email, ctx.restaurant.name, link, v.role);
-    await db.update(invitations).set({ emailedAt: new Date() }).where(eq(invitations.id, inv.id));
+    await T.staff.update(id, { emailedAt: new Date() });
     emailed = true;
   } catch (e) {
     emailError = e instanceof ApiError ? e.message : "Email could not be sent.";
   }
-  await logActivity(ctx, "staff.invited", "invitation", inv.id, null, { email: v.email, role: v.role });
-  await notify(ctx.restaurantId, "STAFF_INVITE", `Invitation created for ${v.email}`, v.role);
-  // The owner is authorised to share the link manually when email is unavailable.
-  return { invitation: { id: inv.id, email: inv.email, role: inv.role }, emailed, emailError, link: emailed ? undefined : link };
+  await logActivity(ctx, "staff.invited", "invitation", id, null, { email: v.email, role: v.role });
+  await notify(ctx.restaurantId, "STAFF_INVITE", `Invitation created for ${v.email}`, v.role, `staff-invite:${id}`);
+  // The owner may share the link manually when e-mail is unavailable.
+  return { invitation: { id, email: v.email, role: v.role }, emailed, emailError, link: emailed ? undefined : link };
 });
