@@ -1,9 +1,7 @@
 import { z } from "zod";
-import { and, eq } from "drizzle-orm";
-import { db } from "@/db";
-import { restaurants, members } from "@/db/schema";
 import { api, ApiError, readJson } from "@/lib/server/http";
 import { requireCtx, requireUser, getCtx } from "@/lib/server/auth";
+import { repos } from "@/lib/repositories";
 import { resolveSettings } from "@/lib/server/services/orders";
 import { publicRestaurant } from "@/lib/server/services/restaurant";
 import { logActivity } from "@/lib/server/audit";
@@ -83,12 +81,17 @@ export const POST = api(async (req) => {
   const user = await requireUser();
   if (await getCtx()) throw new ApiError("You already have a workspace.", 409, "EXISTS");
   const body = z.object({ name: z.string().trim().min(1, "Enter your business name").max(80), businessType: z.enum(["CAFE", "RESTAURANT", "HOTEL", "CLOUD_KITCHEN", "OTHER"]).default("CAFE") }).parse(await readJson(req));
+  const R = repos();
   let slug = slugify(body.name);
-  if ((await db.select({ id: restaurants.id }).from(restaurants).where(eq(restaurants.slug, slug)).limit(1)).length) slug = `${slug}-${randomToken(2)}`;
-  const r = await db.transaction(async (tx) => {
-    const [row] = await tx.insert(restaurants).values({ slug, ownerId: user.id, name: body.name, businessType: body.businessType, email: user.email, onboardingStep: 2 }).returning();
-    await tx.insert(members).values({ restaurantId: row.id, userId: user.id, role: "OWNER" });
-    return row;
+  if (await R.restaurants.slugExists(slug)) slug = `${slug}-${randomToken(2)}`;
+  const r = await R.restaurants.createWithOwner({
+    slug,
+    owner: { id: user.id, email: user.email, name: user.name },
+    data: {
+      name: body.name, businessType: body.businessType, phone: "", email: user.email, address: "", city: "", state: "", country: "India", pincode: "",
+      latitude: null, longitude: null, logoUrl: "", accent: "#f59e0b", currency: "INR", timezone: "Asia/Kolkata", settings: {}, loyaltyProgram: null,
+      onboardingStep: 2, onboardingDone: false,
+    },
   });
   return { restaurant: publicRestaurant(r) };
 });
@@ -101,11 +104,9 @@ export const PATCH = api(async (req) => {
   const beforeSettings = resolveSettings(before.settings);
   let nextRaw = before.settings;
   if (sPatch) nextRaw = deepMerge((before.settings ?? {}) as Record<string, unknown>, sPatch);
-  const [after] = await db
-    .update(restaurants)
-    .set({ ...profile, ...(sPatch ? { settings: nextRaw as never } : {}), updatedAt: new Date() })
-    .where(and(eq(restaurants.id, ctx.restaurantId)))
-    .returning();
+  const update = { ...profile, ...(sPatch ? { settings: nextRaw } : {}) };
+  await repos().restaurants.update(ctx.restaurantId, update as never);
+  const after = { ...before, ...update, updatedAt: new Date() };
   const afterSettings = resolveSettings(after.settings);
   if (sPatch?.payments?.upiId !== undefined && beforeSettings.payments.upiId !== afterSettings.payments.upiId) {
     await logActivity(ctx, "settings.upi_changed", "settings", ctx.restaurantId, { upiId: beforeSettings.payments.upiId }, { upiId: afterSettings.payments.upiId });
@@ -114,7 +115,7 @@ export const PATCH = api(async (req) => {
     await logActivity(ctx, "settings.fee_mode_changed", "settings", ctx.restaurantId, { mode: beforeSettings.fees.mode }, { mode: afterSettings.fees.mode });
   }
   if (Object.keys(profile).some((k) => !k.startsWith("onboarding")) || sPatch) {
-    await logActivity(ctx, "settings.updated", "settings", ctx.restaurantId, { profile: pickKeys(before, Object.keys(profile)), settings: sPatch ? beforeSettings : undefined }, { profile, settings: sPatch ? afterSettings : undefined });
+    await logActivity(ctx, "settings.updated", "settings", ctx.restaurantId, { profile: pickKeys(before as unknown as Record<string, unknown>, Object.keys(profile)), settings: sPatch ? beforeSettings : undefined }, { profile, settings: sPatch ? afterSettings : undefined });
   }
   return { restaurant: publicRestaurant(after) };
 });

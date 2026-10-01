@@ -33,20 +33,20 @@ function Stock() {
   const { restaurant } = useShell();
   const toast = useToast();
   const [adj, setAdj] = useState<Row | null>(null);
+  const [version, setVersion] = useState(0);
   const [f, setF] = useState({ mode: "ADD", quantity: "", note: "" });
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [filter, setFilter] = useState("all");
-  async function submit(reload: () => void) {
+  async function submit() {
     if (!adj) return;
     setErr(""); setBusy(true);
-    try { await post("/api/dash/inventory-adjust", { ingredientId: adj.id, mode: f.mode, quantity: Number(f.quantity), note: f.note }); toast.success("Stock updated"); setAdj(null); reload(); } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
+    try { await post("/api/dash/inventory-adjust", { ingredientId: adj.id, mode: f.mode, quantity: Number(f.quantity), note: f.note }); toast.success("Stock updated"); setAdj(null); setVersion((v) => v + 1); } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
   }
-  let reloadRef: () => void = () => {};
   return (
     <>
       <div className="mb-4 flex gap-2 no-print">{[["all", "All"], ["low", "Low stock"]].map(([v, l]) => <Button key={v} size="sm" variant={filter === v ? "primary" : "secondary"} onClick={() => setFilter(v)}>{l}</Button>)}</div>
-      <CrudManager key={filter} resource="ingredients" singular="Ingredient" plural="Ingredients" softDelete
+      <CrudManager key={`${filter}-${version}`} resource="ingredients" singular="Ingredient" plural="Ingredients" softDelete
         fields={[{ key: "name", label: "Name", type: "text", required: true }, { key: "unit", label: "Unit", type: "text", placeholder: "g, ml, pcs", required: true }, { key: "currentStock", label: "Opening stock", type: "number", step: 0.01, createOnly: true }, { key: "lowStockThreshold", label: "Low-stock threshold", type: "number", step: 0.01 }, { key: "costPerUnit", label: `Cost per unit (${restaurant.currency})`, type: "money" }, { key: "isActive", label: "Active", type: "boolean", editOnly: true }]}
         defaults={{ name: "", unit: "g", currentStock: 0, lowStockThreshold: 0, costPerUnit: 0, isActive: true }} emptyText="Add ingredients like Milk or Coffee Powder, then map them to recipes."
         deleteMessage={(r) => `“${r.name}” will be deactivated (its history is kept).`}
@@ -56,9 +56,9 @@ function Stock() {
           { key: "lowStockThreshold", label: "Threshold", render: (r) => `${r.lowStockThreshold} ${r.unit}` },
           { key: "costPerUnit", label: "Cost/unit", render: (r) => <PriceDisplay minor={r.costPerUnit} currency={restaurant.currency} /> },
         ]}
-        extraActions={(r, reload) => { reloadRef = reload; return <Button size="sm" variant="secondary" onClick={() => { setAdj(r); setF({ mode: "ADD", quantity: "", note: "" }); setErr(""); }}><SlidersHorizontal className="size-3.5" />Adjust</Button>; }}
+        extraActions={(r) => { return <Button size="sm" variant="secondary" onClick={() => { setAdj(r); setF({ mode: "ADD", quantity: "", note: "" }); setErr(""); }}><SlidersHorizontal className="size-3.5" />Adjust</Button>; }}
       />
-      <Modal open={!!adj} onClose={() => setAdj(null)} title={adj ? `Adjust ${adj.name}` : ""} footer={<><Button variant="ghost" onClick={() => setAdj(null)}>Cancel</Button><Button loading={busy} onClick={() => submit(() => reloadRef())}>Apply</Button></>}>
+      <Modal open={!!adj} onClose={() => setAdj(null)} title={adj ? `Adjust ${adj.name}` : ""} footer={<><Button variant="ghost" onClick={() => setAdj(null)}>Cancel</Button><Button loading={busy} onClick={() => submit()}>Apply</Button></>}>
         {adj && <div className="space-y-4">
           <p className="text-sm text-muted">Current stock: <b className="text-white">{adj.currentStock} {adj.unit}</b></p>
           {err && <Notice tone="bad">{err}</Notice>}

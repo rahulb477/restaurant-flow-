@@ -6,6 +6,7 @@ import { formatMoney } from "@/lib/calculations";
 import { patch, post, useApi } from "@/lib/client/api";
 import { Button, Card, ConfirmDialog, DataTable, ErrorState, Field, ImageUploader, Input, ListSkeleton, Notice, PageHeader, Select, Tabs, Toggle, useToast } from "@/components/ui";
 import { RoleGate, useShell } from "@/components/shell";
+import { authMessage, changePassword, signOutEverywhere } from "@/lib/firebase/auth";
 
  
 type R = Record<string, any>;
@@ -57,7 +58,7 @@ function Settings() {
 
       {tab === "business" && (
         <Card className="max-w-2xl space-y-4 p-6">
-          <Field label="Logo"><ImageUploader value={r.logoUrl} onChange={(u) => setR({ ...r, logoUrl: u })} label="Logo" maxMb={integ.maxUploadMb} /></Field>
+          <Field label="Logo"><ImageUploader value={r.logoUrl} onChange={(u) => setR({ ...r, logoUrl: u })} label="Logo" folder="logo" maxMb={integ.maxUploadMb} /></Field>
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Business name"><Input value={r.name} onChange={(e) => setR({ ...r, name: e.target.value })} /></Field>
             <Field label="Brand accent colour"><div className="flex gap-2"><input type="color" aria-label="Accent colour" value={r.accent} onChange={(e) => setR({ ...r, accent: e.target.value })} className="h-10 w-14 rounded-lg border border-line bg-surface2 p-1" /><Input value={r.accent} onChange={(e) => setR({ ...r, accent: e.target.value })} /></div></Field>
@@ -164,7 +165,7 @@ function Account() {
     if (f.next.length < 8) return setErr("New password must be at least 8 characters.");
     if (f.next !== f.again) return setErr("New passwords don’t match.");
     setBusy(true);
-    try { await post("/api/auth/change-password", { current: f.current, next: f.next }); toast.success("Password changed"); setF({ current: "", next: "", again: "" }); } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
+    try { await changePassword(f.current, f.next); toast.success("Password changed"); setF({ current: "", next: "", again: "" }); } catch (e) { setErr(authMessage(e)); } finally { setBusy(false); }
   }
   const summarize = (a: { before: unknown; after: unknown }) => { const j = (x: unknown) => (x ? JSON.stringify(x).slice(0, 90) : ""); return a.before || a.after ? `${j(a.before)}${a.before && a.after ? " → " : ""}${j(a.after)}` : "—"; };
   return (
@@ -174,7 +175,7 @@ function Account() {
         <h2 className="mb-3 mt-5 font-semibold">Change password</h2>
         {err && <div className="mb-3"><Notice tone="bad">{err}</Notice></div>}
         <div className="grid gap-3 sm:grid-cols-3"><Field label="Current password"><Input type="password" autoComplete="current-password" value={f.current} onChange={(e) => setF({ ...f, current: e.target.value })} /></Field><Field label="New password"><Input type="password" autoComplete="new-password" value={f.next} onChange={(e) => setF({ ...f, next: e.target.value })} /></Field><Field label="Repeat new password"><Input type="password" autoComplete="new-password" value={f.again} onChange={(e) => setF({ ...f, again: e.target.value })} /></Field></div>
-        <div className="mt-4 flex gap-2"><Button loading={busy} onClick={change}>Update password</Button><Button variant="outline" onClick={async () => { await post("/api/auth/logout"); window.location.href = "/login"; }}>Log out</Button></div>
+        <div className="mt-4 flex gap-2"><Button loading={busy} onClick={change}>Update password</Button><Button variant="outline" onClick={async () => { await signOutEverywhere(); window.location.href = "/login"; }}>Log out</Button></div>
       </Card>
       <div><h2 className="mb-3 font-semibold">Activity log</h2>
         {log.data?.items.length ? <DataTable columns={[{ key: "createdAt", label: "When", render: (a) => new Date(a.createdAt).toLocaleString() }, { key: "action", label: "Action", render: (a) => <span className="font-mono text-xs">{a.action}</span> }, { key: "actorName", label: "By", render: (a) => `${a.actorName} (${a.actorRole.toLowerCase()})` }, { key: "before", label: "Change", render: (a) => <span className="text-xs text-muted">{summarize(a)}</span> }]} rows={log.data.items} /> : <p className="text-sm text-muted">{log.loading ? "Loading…" : "No activity recorded yet."}</p>}

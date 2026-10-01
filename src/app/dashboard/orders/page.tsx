@@ -4,6 +4,8 @@ import { Eye, Receipt } from "lucide-react";
 import Link from "next/link";
 import { formatMoney } from "@/lib/calculations";
 import { patch, useApi, useDebounced } from "@/lib/client/api";
+import { useOrdersLive } from "@/lib/client/realtime";
+import { filterOrders } from "@/lib/order-filters";
 import { Button, Card, ConfirmDialog, EmptyState, ErrorState, ListSkeleton, Modal, Notice, PageHeader, Pagination, SearchInput, StatusBadge, Tabs, Textarea, useToast, cx } from "@/components/ui";
 import { ItemLines, Timeline, Totals, type OrderRow } from "@/components/order-ui";
 import { UpiQr } from "@/components/upi";
@@ -27,7 +29,11 @@ function Orders() {
   const q = useDebounced(search);
   const [offset, setOffset] = useState(0);
   const limit = 24;
-  const { data, error, loading, reload } = useApi<{ items: OrderRow[]; total: number }>(`/api/orders?status=${filter}&limit=${limit}&offset=${offset}${q ? `&q=${encodeURIComponent(q)}` : ""}`, { poll: 5000 });
+  const live = useOrdersLive<OrderRow>(restaurant.id);
+  const { error, loading } = live;
+  const reload = () => undefined; // listeners push changes; nothing to refetch
+  const all = filterOrders<OrderRow>((live.data ?? []) as OrderRow[], { filter, q });
+  const data = live.data ? { items: all.slice(offset, offset + limit), total: all.length } : null;
   const cfg = useApi<Settings>("/api/restaurant");
   const [view, setView] = useState<OrderRow | null>(null);
   const [pay, setPay] = useState<OrderRow | null>(null);
@@ -66,7 +72,7 @@ function Orders() {
   const p = cfg.data?.restaurant.settings.payments;
   return (
     <div>
-      <PageHeader title="Orders" subtitle="Live orders from QR, POS and staff. Updates automatically." />
+      <PageHeader title="Orders" subtitle="Live orders from QR, POS and staff — updates instantly." />
       <Tabs tabs={FILTERS.map(([id, label]) => ({ id, label }))} value={filter} onChange={(f) => { setFilter(f); setOffset(0); }} />
       <SearchInput value={search} onChange={(v) => { setSearch(v); setOffset(0); }} placeholder="Search order ID, table, customer…" className="mb-5 max-w-md" />
       {error && !data ? <ErrorState message={error} onRetry={reload} /> : loading && !data ? <ListSkeleton /> : !orders.length ? <EmptyState title="No orders here" text={q ? "No orders match your search." : "New orders will appear here as they come in."} /> : (

@@ -1,9 +1,10 @@
-import { orders, restaurants } from "@/db/schema";
+import type { Order, Restaurant } from "@/lib/repositories";
 import { formatMoney } from "@/lib/calculations";
 
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 
-export function invoiceHtml(o: typeof orders.$inferSelect, r: typeof restaurants.$inferSelect, footer: string) {
+/** Branded invoice HTML used for e-mail delivery (and mirrored by the printable bill page). */
+export function invoiceHtml(o: Order, r: Restaurant, footer: string) {
   const m = (n: number) => esc(formatMoney(n, r.currency));
   const rows = o.items
     .map((l) => {
@@ -12,8 +13,9 @@ export function invoiceHtml(o: typeof orders.$inferSelect, r: typeof restaurants
     })
     .join("");
   const line = (label: string, v: number, neg = false) => (v ? `<tr><td style="color:#666">${label}</td><td style="text-align:right">${neg ? "-" : ""}${m(v)}</td></tr>` : "");
-  return `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px;color:#111">
-<h2 style="margin:0">${esc(r.name)}</h2>
+  const logo = r.logoUrl ? `<img src="${esc(r.logoUrl)}" alt="" style="height:48px;margin-bottom:8px;border-radius:8px"><br>` : "";
+  return `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px;color:#111;border-top:4px solid ${esc(r.accent || "#f59e0b")}">
+${logo}<h2 style="margin:0">${esc(r.name)}</h2>
 <p style="margin:4px 0 16px;color:#666;font-size:13px">${esc([r.address, r.city, r.state, r.pincode].filter(Boolean).join(", "))}<br>${esc(r.phone)}</p>
 <p style="font-size:13px"><b>Invoice ${esc(o.displayId)}</b><br>${o.createdAt.toLocaleString("en-IN", { timeZone: r.timezone })}${o.tableName ? `<br>Table ${esc(o.tableName)}` : ""}</p>
 <table style="width:100%;border-collapse:collapse;font-size:14px;border-top:1px solid #ddd;border-bottom:1px solid #ddd">${rows}</table>

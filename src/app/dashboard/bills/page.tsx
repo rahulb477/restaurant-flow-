@@ -2,7 +2,9 @@
 import { useState } from "react";
 import Link from "next/link";
 import { Eye } from "lucide-react";
-import { useApi, useDebounced } from "@/lib/client/api";
+import { useDebounced } from "@/lib/client/api";
+import { useOrdersLive } from "@/lib/client/realtime";
+import { filterOrders } from "@/lib/order-filters";
 import { Button, DataTable, EmptyState, ErrorState, ListSkeleton, PageHeader, Pagination, PriceDisplay, SearchInput, StatusBadge } from "@/components/ui";
 import type { OrderRow } from "@/components/order-ui";
 import { RoleGate, useShell } from "@/components/shell";
@@ -16,7 +18,11 @@ function Bills() {
   const [search, setSearch] = useState("");
   const q = useDebounced(search);
   const [offset, setOffset] = useState(0);
-  const { data, error, loading, reload } = useApi<{ items: OrderRow[]; total: number }>(`/api/orders?bills=1&limit=25&offset=${offset}${q ? `&q=${encodeURIComponent(q)}` : ""}`);
+  const live = useOrdersLive<OrderRow>(restaurant.id);
+  const { error, loading } = live;
+  const reload = () => undefined;
+  const all = filterOrders<OrderRow>((live.data ?? []) as OrderRow[], { q, billsOnly: true });
+  const data = live.data ? { items: all.slice(offset, offset + 25), total: all.length } : null;
   return (
     <div>
       <PageHeader title="Bills" subtitle="Invoices for every paid order. View, print, download or email." />

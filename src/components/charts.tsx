@@ -61,15 +61,14 @@ export function BarList({ items, format = (n: number) => String(n), empty = "No 
 export function Donut({ items, format = (n: number) => String(n), empty = "No data for this period" }: { items: { label: string; value: number }[]; format?: (n: number) => string; empty?: string }) {
   const total = items.reduce((s, i) => s + i.value, 0);
   if (!total) return <p className="py-6 text-center text-sm text-muted">{empty}</p>;
-  let acc = 0;
   const R = 52, C = 2 * Math.PI * R;
   return (
     <div className="flex items-center gap-5">
       <svg viewBox="0 0 140 140" className="size-32 shrink-0 -rotate-90" role="img" aria-label="Distribution chart">
         {items.map((i, idx) => {
           const len = (i.value / total) * C;
+          const acc = items.slice(0, idx).reduce((s, x) => s + (x.value / total) * C, 0);
           const el = <circle key={i.label} cx="70" cy="70" r={R} fill="none" stroke={PALETTE[idx % PALETTE.length]} strokeWidth="18" strokeDasharray={`${len} ${C - len}`} strokeDashoffset={-acc} />;
-          acc += len;
           return el;
         })}
       </svg>

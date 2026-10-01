@@ -1,33 +1,36 @@
 import crypto from "node:crypto";
 import { z } from "zod";
-import { and, asc, desc, eq, ilike, or, sql, type SQL } from "drizzle-orm";
-import type { PgTable } from "drizzle-orm/pg-core";
-import { db } from "@/db";
-import { categories, products, variantGroups, addons, ingredients, diningTables, coupons, scratchCampaigns, recipes, inventoryTransactions } from "@/db/schema";
+import { tenantRepos, type TenantRepositories } from "@/lib/repositories";
+import type { Crud } from "@/lib/repositories/interfaces";
 import type { AppModule } from "@/lib/permissions";
 import { slugify } from "@/lib/calculations";
 import { ApiError } from "../http";
 import type { Ctx } from "../auth";
 import { logActivity } from "../audit";
 
-type Row = Record<string, unknown>;
+type Row = Record<string, unknown> & { id?: string };
+type Repo = Crud<Row & { id: string }>;
 type Def = {
-  table: PgTable & { id: unknown; restaurantId: unknown };
+  repo: (T: TenantRepositories) => unknown;
   module: AppModule | AppModule[];
   entity: string;
   create: z.ZodType<Row>;
   update?: z.ZodType<Row>;
   searchCols?: string[];
   order?: string;
+  /** Stable document id derived from the payload (e.g. coupon code) instead of an auto id. */
+  idOf?: (v: Row) => string;
   prepareCreate?: (v: Row) => Row;
   prepareUpdate?: (v: Row, existing: Row) => Row;
-  afterCreate?: (ctx: Ctx, row: Row) => Promise<void>;
-  afterDelete?: (ctx: Ctx, row: Row) => Promise<void>;
+  /** Cross-reference checks: every referenced id must exist inside THIS tenant. */
+  validate?: (T: TenantRepositories, v: Row) => Promise<void>;
+  afterCreate?: (ctx: Ctx, T: TenantRepositories, row: Row) => Promise<void>;
+  afterDelete?: (ctx: Ctx, T: TenantRepositories, row: Row) => Promise<void>;
   softDelete?: boolean;
   actionFor?: (before: Row, after: Row) => string | null;
 };
 
-const id = z.string().uuid();
+const id = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/, "Invalid id");
 const money = z.number().int().min(0).max(100_000_000);
 const optId = z.union([id, z.literal(""), z.null()]).transform((v) => (v ? v : null));
 const date = z.union([z.string(), z.null()]).transform((v) => (v ? new Date(v) : null)).refine((d) => d === null || !Number.isNaN(d.getTime()), "Invalid date");
@@ -35,20 +38,27 @@ const nameStr = z.string().trim().min(1, "Name is required").max(120);
 
 const optionSchema = z.object({ id: z.string().optional(), name: nameStr, priceAdjustment: z.number().int().min(-100_000_00).max(100_000_00).default(0), isAvailable: z.boolean().default(true), sortOrder: z.number().int().default(0) });
 
+async function mustExist(repo: Repo, ids: string[], label: string) {
+  const uniq = Array.from(new Set(ids));
+  if (!uniq.length) return;
+  const found = await repo.getMany(uniq);
+  if (found.length !== uniq.length) throw new ApiError(`One of the selected ${label} does not exist.`, 400, "VALIDATION");
+}
+
 const defs: Record<string, Def> = {
   categories: {
-    table: categories as never,
+    repo: (T) => T.categories,
     module: "menu",
     entity: "category",
     create: z.object({ name: nameStr, imageUrl: z.string().max(500).default(""), sortOrder: z.number().int().default(0), isActive: z.boolean().default(true) }),
     searchCols: ["name"],
     order: "sortOrder",
-    afterDelete: async (ctx, row) => {
-      await db.update(products).set({ categoryId: null }).where(and(eq(products.restaurantId, ctx.restaurantId), eq(products.categoryId, row.id as string)));
+    afterDelete: async (_ctx, T, row) => {
+      await T.products.clearCategory(row.id as string);
     },
   },
   products: {
-    table: products as never,
+    repo: (T) => T.products,
     module: ["menu", "inventory"],
     entity: "product",
     create: z.object({
@@ -70,13 +80,18 @@ const defs: Record<string, Def> = {
     order: "sortOrder",
     prepareCreate: (v) => ({ ...v, slug: slugify(String(v.name)) }),
     prepareUpdate: (v) => (v.name ? { ...v, slug: slugify(String(v.name)) } : v),
-    afterDelete: async (ctx, row) => {
-      await db.delete(recipes).where(and(eq(recipes.restaurantId, ctx.restaurantId), eq(recipes.productId, row.id as string)));
+    afterDelete: async (_ctx, T, row) => {
+      await T.recipes.remove(row.id as string);
+    },
+    validate: async (T, v) => {
+      if (v.categoryId) await mustExist(T.categories as unknown as Repo, [v.categoryId as string], "categories");
+      await mustExist(T.variantGroups as unknown as Repo, (v.variantGroupIds as string[] | undefined) ?? [], "variant groups");
+      await mustExist(T.addons as unknown as Repo, (v.addonIds as string[] | undefined) ?? [], "add-ons");
     },
     actionFor: (b, a) => (b.price !== a.price ? "product.price_changed" : b.availability !== a.availability ? "product.availability_changed" : null),
   },
   "variant-groups": {
-    table: variantGroups as never,
+    repo: (T) => T.variantGroups,
     module: "menu",
     entity: "variantGroup",
     create: z
@@ -94,56 +109,55 @@ const defs: Record<string, Def> = {
     searchCols: ["name"],
     prepareCreate: (v) => ({ ...v, options: (v.options as z.infer<typeof optionSchema>[]).map((o, i) => ({ ...o, id: o.id || crypto.randomUUID(), sortOrder: i })) }),
     prepareUpdate: (v) => (v.options ? { ...v, options: (v.options as z.infer<typeof optionSchema>[]).map((o, i) => ({ ...o, id: o.id || crypto.randomUUID(), sortOrder: i })) } : v),
-    afterDelete: async (ctx, row) => {
-      await db.execute(
-        sql`update products set variant_group_ids = coalesce((select jsonb_agg(e) from jsonb_array_elements_text(variant_group_ids) e where e <> ${row.id as string}), '[]'::jsonb) where restaurant_id = ${ctx.restaurantId}`,
-      );
+    afterDelete: async (_ctx, T, row) => {
+      await T.products.removeVariantGroupRef(row.id as string);
     },
   },
   addons: {
-    table: addons as never,
+    repo: (T) => T.addons,
     module: "menu",
     entity: "addon",
     create: z.object({ name: nameStr, price: money, isAvailable: z.boolean().default(true), isActive: z.boolean().default(true), sortOrder: z.number().int().default(0) }),
     searchCols: ["name"],
     order: "sortOrder",
-    afterDelete: async (ctx, row) => {
-      await db.execute(sql`update products set addon_ids = coalesce((select jsonb_agg(e) from jsonb_array_elements_text(addon_ids) e where e <> ${row.id as string}), '[]'::jsonb) where restaurant_id = ${ctx.restaurantId}`);
+    afterDelete: async (_ctx, T, row) => {
+      await T.products.removeAddonRef(row.id as string);
     },
   },
   ingredients: {
-    table: ingredients as never,
+    repo: (T) => T.ingredients,
     module: ["inventory", "menu"],
     entity: "ingredient",
     create: z.object({ name: nameStr, unit: z.string().trim().min(1).max(12).default("g"), currentStock: z.number().min(0).max(1e9).default(0), lowStockThreshold: z.number().min(0).max(1e9).default(0), costPerUnit: money.default(0), isActive: z.boolean().default(true) }),
     update: z.object({ name: nameStr, unit: z.string().trim().min(1).max(12), lowStockThreshold: z.number().min(0).max(1e9), costPerUnit: money, isActive: z.boolean() }).partial(), // stock only via /inventory/adjust
     searchCols: ["name"],
     softDelete: true,
-    afterCreate: async (ctx, row) => {
+    afterCreate: async (ctx, T, row) => {
       if (Number(row.currentStock) > 0) {
-        await db.insert(inventoryTransactions).values({ restaurantId: ctx.restaurantId, ingredientId: row.id as string, type: "RESTOCK", quantityBefore: 0, quantityUsed: -Number(row.currentStock), quantityAfter: Number(row.currentStock), note: "Opening stock", actorId: ctx.user.id });
+        await T.inventoryTransactions.create(null, { ingredientId: row.id as string, orderId: null, type: "RESTOCK", quantityBefore: 0, quantityUsed: -Number(row.currentStock), quantityAfter: Number(row.currentStock), note: "Opening stock", actorId: ctx.user.id, createdAt: new Date() });
       }
     },
   },
   tables: {
-    table: diningTables as never,
+    repo: (T) => T.tables,
     module: "tables",
     entity: "table",
     create: z.object({ name: nameStr.max(30), number: z.number().int().min(0).max(9999).default(0), status: z.enum(["FREE", "OCCUPIED", "RESERVED"]).default("FREE"), isActive: z.boolean().default(true) }),
     update: z.object({ name: nameStr.max(30), number: z.number().int().min(0).max(9999), status: z.enum(["FREE", "OCCUPIED", "RESERVED"]), isActive: z.boolean(), regenerateQr: z.boolean() }).partial(),
     searchCols: ["name"],
     order: "number",
-    prepareCreate: (v) => ({ ...v, qrToken: crypto.randomBytes(12).toString("hex") }),
+    prepareCreate: (v) => ({ ...v, qrToken: crypto.randomBytes(12).toString("base64url") }),
     prepareUpdate: (v) => {
       const { regenerateQr, ...rest } = v;
-      return regenerateQr ? { ...rest, qrToken: crypto.randomBytes(12).toString("hex") } : rest;
+      return regenerateQr ? { ...rest, qrToken: crypto.randomBytes(12).toString("base64url") } : rest;
     },
     actionFor: (b, a) => (b.qrToken !== a.qrToken ? "table.qr_regenerated" : null),
   },
   coupons: {
-    table: coupons as never,
+    repo: (T) => T.coupons,
     module: ["promotions"],
     entity: "coupon",
+    idOf: (v) => v.code as string,
     create: z
       .object({
         code: z.string().trim().toUpperCase().regex(/^[A-Z0-9_-]{3,24}$/, "Code must be 3-24 letters/numbers"),
@@ -167,7 +181,7 @@ const defs: Record<string, Def> = {
     searchCols: ["code", "name"],
   },
   "scratch-campaigns": {
-    table: scratchCampaigns as never,
+    repo: (T) => T.scratchCampaigns,
     module: "scratch",
     entity: "scratchCampaign",
     create: z
@@ -186,57 +200,72 @@ const defs: Record<string, Def> = {
 
 export const RESOURCE_NAMES = Object.keys(defs);
 export function getDef(name: string): Def {
-  const d = defs[name];
+  const d = Object.prototype.hasOwnProperty.call(defs, name) ? defs[name] : undefined;
   if (!d) throw new ApiError("Unknown resource", 404, "NOT_FOUND");
   return d;
 }
 
-const col = (d: Def, name: string) => (d.table as unknown as Record<string, never>)[name];
+const repoOf = (d: Def, ctx: Ctx) => d.repo(tenantRepos(ctx.restaurantId)) as Repo;
+const byName = (a: Row, b: Row) => String(a.name ?? a.code ?? "").localeCompare(String(b.name ?? b.code ?? ""));
+const time = (v: unknown) => (v instanceof Date ? v.getTime() : 0);
 
 export async function listResource(ctx: Ctx, name: string, q: { search?: string; limit?: number; offset?: number }) {
   const d = getDef(name);
-  const where: SQL[] = [eq(col(d, "restaurantId"), ctx.restaurantId)];
+  let rows = (await repoOf(d, ctx).list({ limit: 1000 })) as Row[];
   if (q.search && d.searchCols?.length) {
-    const s = `%${q.search.replace(/[%_]/g, "")}%`;
-    where.push(or(...d.searchCols.map((c) => ilike(col(d, c), s)))!);
+    const s = q.search.toLowerCase();
+    rows = rows.filter((r) => d.searchCols!.some((c) => String(r[c] ?? "").toLowerCase().includes(s)));
   }
-  const orderCol = d.order ? col(d, d.order) : undefined;
+  rows.sort((a, b) => (d.order ? Number(a[d.order] ?? 0) - Number(b[d.order] ?? 0) || byName(a, b) : time(b.createdAt) - time(a.createdAt) || byName(a, b)));
   const limit = Math.min(q.limit ?? 300, 500);
-  const rows = await db
-    .select()
-    .from(d.table as PgTable)
-    .where(and(...where))
-    .orderBy(orderCol ? asc(orderCol) : desc(col(d, "createdAt")), asc(col(d, "name")) as never)
-    .limit(limit)
-    .offset(q.offset ?? 0);
-  const total = (await db.select({ n: sql<number>`count(*)::int` }).from(d.table as PgTable).where(and(...where)))[0].n;
-  return { items: rows, total };
+  return { items: rows.slice(q.offset ?? 0, (q.offset ?? 0) + limit), total: rows.length };
 }
 
 async function getRow(ctx: Ctx, d: Def, rowId: string) {
-  const r = (await db.select().from(d.table as PgTable).where(and(eq(col(d, "id"), rowId), eq(col(d, "restaurantId"), ctx.restaurantId))).limit(1))[0] as Row | undefined;
+  const r = await repoOf(d, ctx).get(rowId);
   if (!r) throw new ApiError("Not found", 404, "NOT_FOUND");
-  return r;
+  return r as Row;
 }
 
 export async function createResource(ctx: Ctx, name: string, body: unknown) {
   const d = getDef(name);
+  const T = tenantRepos(ctx.restaurantId);
   let v = d.create.parse(body);
   if (d.prepareCreate) v = d.prepareCreate(v);
-  const row = (await db.insert(d.table as PgTable).values({ ...v, restaurantId: ctx.restaurantId } as never).returning())[0] as Row;
+  if (d.validate) await d.validate(T, v);
+  const now = new Date();
+  const data = { ...v, createdAt: now, updatedAt: now };
+  let row: Row;
+  if (name === "tables") {
+    row = (await T.tables.createWithQr(ctx.restaurantId, data as never)) as unknown as Row;
+  } else {
+    row = (await repoOf(d, ctx).create(d.idOf ? d.idOf(v) : null, data as never)) as Row;
+  }
   await logActivity(ctx, `${d.entity}.created`, d.entity, String(row.id), null, row);
-  if (d.afterCreate) await d.afterCreate(ctx, row);
+  if (d.afterCreate) await d.afterCreate(ctx, T, row);
   return row;
 }
 
 export async function updateResource(ctx: Ctx, name: string, rowId: string, body: unknown) {
   const d = getDef(name);
+  const T = tenantRepos(ctx.restaurantId);
   const before = await getRow(ctx, d, rowId);
   const schema = d.update ?? (d.create as unknown as z.ZodObject).partial?.() ?? d.create;
   let v = schema.parse(body);
   if (d.prepareUpdate) v = d.prepareUpdate(v, before);
   if (!Object.keys(v).length) return before;
-  const row = (await db.update(d.table as PgTable).set({ ...v, ...(("updatedAt" in (d.table as object)) ? { updatedAt: new Date() } : {}) } as never).where(and(eq(col(d, "id"), rowId), eq(col(d, "restaurantId"), ctx.restaurantId))).returning())[0] as Row;
+  if (d.validate) await d.validate(T, { ...before, ...v });
+  const { id: _ignored, ...patchRaw } = v;
+  void _ignored;
+  let patch = patchRaw;
+  if (name === "tables" && typeof patch.qrToken === "string" && patch.qrToken !== before.qrToken) {
+    await T.tables.rotateQr(ctx.restaurantId, rowId, patch.qrToken);
+    const { qrToken: _q, ...rest } = patch;
+    void _q;
+    patch = rest;
+  }
+  const row = { ...before, ...patchRaw, updatedAt: new Date(), id: rowId } as Row;
+  if (Object.keys(patch).length) await repoOf(d, ctx).update(rowId, { ...patch, updatedAt: row.updatedAt } as never);
   const action = d.actionFor?.(before, row) ?? `${d.entity}.updated`;
   await logActivity(ctx, action, d.entity, rowId, before, row);
   return row;
@@ -244,14 +273,16 @@ export async function updateResource(ctx: Ctx, name: string, rowId: string, body
 
 export async function deleteResource(ctx: Ctx, name: string, rowId: string) {
   const d = getDef(name);
+  const T = tenantRepos(ctx.restaurantId);
   const before = await getRow(ctx, d, rowId);
   if (d.softDelete) {
-    await db.update(d.table as PgTable).set({ isActive: false, updatedAt: new Date() } as never).where(and(eq(col(d, "id"), rowId), eq(col(d, "restaurantId"), ctx.restaurantId)));
+    await repoOf(d, ctx).update(rowId, { isActive: false, updatedAt: new Date() } as never);
     await logActivity(ctx, `${d.entity}.deactivated`, d.entity, rowId, before, { ...before, isActive: false });
     return { ok: true, deactivated: true };
   }
-  await db.delete(d.table as PgTable).where(and(eq(col(d, "id"), rowId), eq(col(d, "restaurantId"), ctx.restaurantId)));
-  if (d.afterDelete) await d.afterDelete(ctx, before);
+  if (name === "tables") await T.tables.deleteWithQr(rowId);
+  else await repoOf(d, ctx).remove(rowId);
+  if (d.afterDelete) await d.afterDelete(ctx, T, before);
   await logActivity(ctx, `${d.entity}.deleted`, d.entity, rowId, before, null);
   return { ok: true };
 }

@@ -1,15 +1,12 @@
 import crypto from "node:crypto";
 import { serverEnv, integrations, publicEnv } from "@/config/env";
 import { ApiError } from "./http";
-import { buildUpiUri } from "@/lib/calculations";
 
 /* ================================ Email ================================ */
 export interface EmailProvider {
   isConfigured(): boolean;
   sendInvoice(to: string, subject: string, html: string): Promise<void>;
   sendStaffInvitation(to: string, restaurantName: string, link: string, role: string): Promise<void>;
-  sendVerificationEmail(to: string, link: string): Promise<void>;
-  sendPasswordReset(to: string, link: string): Promise<void>;
   sendNotification(to: string, subject: string, html: string): Promise<void>;
 }
 
@@ -42,12 +39,6 @@ class ConfiguredEmailProvider implements EmailProvider {
   }
   sendStaffInvitation(to: string, restaurantName: string, link: string, role: string) {
     return this.send(to, `You're invited to ${restaurantName}`, wrap(`Join ${restaurantName}`, `<p>You've been invited as <b>${esc(role)}</b>. The link expires in 7 days.</p>${button(link, "Accept invitation")}`));
-  }
-  sendVerificationEmail(to: string, link: string) {
-    return this.send(to, "Verify your email", wrap("Verify your email", button(link, "Verify email")));
-  }
-  sendPasswordReset(to: string, link: string) {
-    return this.send(to, "Reset your password", wrap("Reset your password", `<p>This link expires in 1 hour.</p>${button(link, "Reset password")}`));
   }
   sendNotification(to: string, subject: string, html: string) {
     return this.send(to, subject, wrap(subject, html));
@@ -128,115 +119,102 @@ class ConfiguredAIProvider implements AIProvider {
   }
 }
 
-/** Only used when NEXT_PUBLIC_DEMO_MODE=true and no AI provider is configured. */
-class MockAIProvider implements AIProvider {
-  isConfigured() {
-    return true;
-  }
-  async digitizeMenu(): Promise<DigitizedMenu> {
-    throw new ApiError("Menu digitization requires a configured AI provider.", 503, "AI_NOT_CONFIGURED");
-  }
-  async generateReview(input: { restaurantName: string; rating: number; items: string[] }) {
-    const food = input.items.slice(0, 2).join(" and ") || "our order";
-    return input.rating >= 4
-      ? `Had a lovely time at ${input.restaurantName}. The ${food} was fresh and the service was quick. Would happily visit again!`
-      : `Visited ${input.restaurantName} and tried ${food}. It was okay, with some room to improve on the experience.`;
-  }
-}
-export const aiProvider: AIProvider = integrations.ai() ? new ConfiguredAIProvider() : publicEnv.demoMode ? new MockAIProvider() : new ConfiguredAIProvider();
+/** Single provider: when AI is not configured every call fails with an explicit AI_NOT_CONFIGURED error — results are never faked. */
+export const aiProvider: AIProvider = new ConfiguredAIProvider();
 export const digitizer: AIProvider = new ConfiguredAIProvider();
 
 /* ================================ Payments ================================ */
-export type PaymentIntent = { providerRef: string; status: "PENDING" | "PROCESSING" | "SUCCESS" | "FAILED"; action?: { type: "UPI_URI" | "CHECKOUT"; uri?: string } };
+export type ProviderPaymentStatus = "PENDING" | "PROCESSING" | "SUCCESS" | "FAILED" | "CANCELLED";
+export type PaymentIntent = { providerRef: string; status: ProviderPaymentStatus; action?: { type: "REDIRECT"; url: string } };
+export type WebhookEvent = { providerRef: string; restaurantId: string; orderId: string; status: ProviderPaymentStatus; amountMinor: number | null };
+
+/**
+ * Online-payment provider abstraction. The concrete adapter is selected by PAYMENT_PROVIDER in .env;
+ * nothing is hard-wired to a specific gateway. Payment success is ONLY ever established by a verified
+ * provider callback (webhook) or a server-side status lookup — never by the browser.
+ */
 export interface PaymentProvider {
   name: string;
   isConfigured(): boolean;
-  createPayment(o: { orderId: string; amountMinor: number; currency: string; upiId?: string; payeeName?: string; reference?: string }): Promise<PaymentIntent>;
-  verifyPayment(o: { providerRef: string; paymentId?: string; signature?: string }): Promise<{ verified: boolean }>;
-  getPaymentStatus(providerRef: string): Promise<PaymentIntent["status"]>;
+  createPayment(o: { restaurantId: string; orderId: string; displayId: string; amountMinor: number; currency: string; returnUrl: string; customer?: { name?: string; phone?: string; email?: string } }): Promise<PaymentIntent>;
+  /** Verifies the authenticity of a webhook call from the RAW request body. */
+  verifyWebhook(rawBody: string, signature: string | null): boolean;
+  parseWebhook(body: unknown): WebhookEvent | null;
+  getPaymentStatus(providerRef: string): Promise<ProviderPaymentStatus>;
   refundPayment(providerRef: string, amountMinor: number): Promise<{ refunded: boolean }>;
 }
 
-export const cashProvider: PaymentProvider = {
-  name: "CASH",
-  isConfigured: () => true,
-  async createPayment(o) {
-    return { providerRef: `cash:${o.orderId}`, status: "PENDING" };
-  },
-  async verifyPayment() {
-    return { verified: false }; // cash is confirmed by staff in person
-  },
-  async getPaymentStatus() {
-    return "PENDING";
-  },
-  async refundPayment() {
-    return { refunded: false };
-  },
+export const hmacHex = (secret: string, body: string) => crypto.createHmac("sha256", secret).update(body).digest("hex");
+export const safeEqual = (a: string, b: string) => {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
 };
 
-export const upiProvider: PaymentProvider = {
-  name: "UPI",
-  isConfigured: () => true,
-  async createPayment(o) {
-    if (!o.upiId) throw new ApiError("UPI is not set up for this restaurant.", 400, "UPI_NOT_SET");
-    return {
-      providerRef: `upi:${o.orderId}`,
-      status: "PENDING",
-      action: { type: "UPI_URI", uri: buildUpiUri({ upiId: o.upiId, name: o.payeeName ?? "Merchant", amountMinor: o.amountMinor, ref: o.reference, note: o.reference, currency: o.currency }) },
-    };
-  },
-  async verifyPayment() {
-    return { verified: false }; // a UPI deep link cannot prove payment; staff confirm receipt
-  },
-  async getPaymentStatus() {
-    return "PENDING";
-  },
-  async refundPayment() {
-    return { refunded: false };
-  },
-};
-
-/** Razorpay-compatible online provider; active only when configured in env. */
-export const onlineProvider: PaymentProvider = {
-  name: "ONLINE",
-  isConfigured: () => integrations.onlinePayments(),
-  async createPayment(o) {
+/** Razorpay Payment Links adapter (redirect based — no client-side gateway script required). */
+class RazorpayProvider implements PaymentProvider {
+  name = "razorpay";
+  private auth() {
+    return "Basic " + Buffer.from(`${serverEnv.PAYMENT_KEY_ID}:${serverEnv.PAYMENT_SECRET_KEY}`).toString("base64");
+  }
+  isConfigured() {
+    return integrations.onlinePayments();
+  }
+  async createPayment(o: Parameters<PaymentProvider["createPayment"]>[0]): Promise<PaymentIntent> {
     if (!this.isConfigured()) throw new ApiError("Online payments are not configured.", 503, "PAYMENT_NOT_CONFIGURED");
-    const res = await fetch("https://api.razorpay.com/v1/orders", {
+    const res = await fetch("https://api.razorpay.com/v1/payment_links", {
       method: "POST",
-      headers: { Authorization: "Basic " + Buffer.from(`${serverEnv.PAYMENT_KEY_ID}:${serverEnv.PAYMENT_SECRET_KEY}`).toString("base64"), "Content-Type": "application/json" },
-      body: JSON.stringify({ amount: o.amountMinor, currency: o.currency, receipt: o.reference ?? o.orderId }),
-    });
-    if (!res.ok) throw new ApiError("Could not start the online payment.", 502, "PAYMENT_FAILED");
-    const data = (await res.json()) as { id: string };
-    return { providerRef: data.id, status: "PENDING", action: { type: "CHECKOUT" } };
-  },
-  async verifyPayment(o) {
-    if (!this.isConfigured() || !o.paymentId || !o.signature) return { verified: false };
-    const expected = crypto.createHmac("sha256", serverEnv.PAYMENT_SECRET_KEY!).update(`${o.providerRef}|${o.paymentId}`).digest("hex");
-    const a = Buffer.from(expected);
-    const b = Buffer.from(o.signature);
-    return { verified: a.length === b.length && crypto.timingSafeEqual(a, b) };
-  },
-  async getPaymentStatus(ref) {
+      headers: { Authorization: this.auth(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        amount: o.amountMinor,
+        currency: o.currency,
+        reference_id: o.orderId,
+        notes: { restaurantId: o.restaurantId, orderId: o.orderId },
+        description: `Order ${o.displayId}`,
+        customer: { name: o.customer?.name || undefined, contact: o.customer?.phone || undefined, email: o.customer?.email || undefined },
+        callback_url: o.returnUrl,
+        callback_method: "get",
+      }),
+    }).catch(() => null);
+    if (!res || !res.ok) throw new ApiError("Could not start the online payment. Please try another method.", 502, "PAYMENT_FAILED");
+    const d = (await res.json()) as { id: string; short_url: string };
+    return { providerRef: d.id, status: "PROCESSING", action: { type: "REDIRECT", url: d.short_url } };
+  }
+  verifyWebhook(rawBody: string, signature: string | null) {
+    const secret = serverEnv.PAYMENT_WEBHOOK_SECRET;
+    if (!secret || !signature) return false;
+    return safeEqual(hmacHex(secret, rawBody), signature);
+  }
+  parseWebhook(body: unknown): WebhookEvent | null {
+    const b = body as { event?: string; payload?: { payment_link?: { entity?: { id?: string; notes?: { restaurantId?: string; orderId?: string }; amount?: number } } } };
+    const link = b?.payload?.payment_link?.entity;
+    const restaurantId = link?.notes?.restaurantId;
+    const orderId = link?.notes?.orderId;
+    if (!b?.event || !link?.id || !restaurantId || !orderId) return null;
+    const status: ProviderPaymentStatus | null = b.event === "payment_link.paid" ? "SUCCESS" : b.event === "payment_link.cancelled" ? "CANCELLED" : b.event === "payment_link.expired" ? "FAILED" : null;
+    if (!status) return null;
+    return { providerRef: link.id, restaurantId, orderId, status, amountMinor: typeof link.amount === "number" ? link.amount : null };
+  }
+  async getPaymentStatus(ref: string): Promise<ProviderPaymentStatus> {
     if (!this.isConfigured()) return "PENDING";
-    const res = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(ref)}`, {
-      headers: { Authorization: "Basic " + Buffer.from(`${serverEnv.PAYMENT_KEY_ID}:${serverEnv.PAYMENT_SECRET_KEY}`).toString("base64") },
-    });
-    if (!res.ok) return "FAILED";
+    const res = await fetch(`https://api.razorpay.com/v1/payment_links/${encodeURIComponent(ref)}`, { headers: { Authorization: this.auth() } }).catch(() => null);
+    if (!res?.ok) return "PROCESSING";
     const d = (await res.json()) as { status: string };
-    return d.status === "captured" ? "SUCCESS" : d.status === "failed" ? "FAILED" : "PROCESSING";
-  },
-  async refundPayment(ref, amountMinor) {
-    if (!this.isConfigured()) return { refunded: false };
-    const res = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(ref)}/refund`, {
-      method: "POST",
-      headers: { Authorization: "Basic " + Buffer.from(`${serverEnv.PAYMENT_KEY_ID}:${serverEnv.PAYMENT_SECRET_KEY}`).toString("base64"), "Content-Type": "application/json" },
-      body: JSON.stringify({ amount: amountMinor }),
-    });
-    return { refunded: res.ok };
-  },
-};
+    return d.status === "paid" ? "SUCCESS" : d.status === "cancelled" ? "CANCELLED" : d.status === "expired" ? "FAILED" : "PROCESSING";
+  }
+  async refundPayment() {
+    return { refunded: false }; // refunds are performed manually from the provider dashboard
+  }
+}
+
+const REGISTRY: Record<string, () => PaymentProvider> = { razorpay: () => new RazorpayProvider() };
+
+/** The online provider named by PAYMENT_PROVIDER, or null when none is configured. */
+export function getPaymentProvider(): PaymentProvider | null {
+  const name = serverEnv.PAYMENT_PROVIDER?.toLowerCase();
+  const p = name ? REGISTRY[name]?.() : undefined;
+  return p && p.isConfigured() ? p : null;
+}
 
 /* ================================== Maps ================================== */
 export interface MapProvider {

@@ -29,8 +29,9 @@ const MATRIX: Record<Role, readonly AppModule[]> = {
   STAFF: ["pos", "orders"],
 };
 
-export const can = (role: string | undefined | null, mod: AppModule) => !!role && (MATRIX[role as Role] ?? []).includes(mod);
-export const modulesFor = (role: string) => MATRIX[role as Role] ?? [];
+const matrixFor = (role: string | undefined | null): readonly AppModule[] => (role && Object.prototype.hasOwnProperty.call(MATRIX, role) ? MATRIX[role as Role] : []);
+export const can = (role: string | undefined | null, mod: AppModule) => matrixFor(role).includes(mod);
+export const modulesFor = (role: string) => matrixFor(role);
 export const homeFor = (role: string) => {
   const m = modulesFor(role)[0];
   return m === "dashboard" ? "/dashboard" : m ? `/dashboard/${m}` : "/login";

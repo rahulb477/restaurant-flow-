@@ -58,7 +58,7 @@ function Menu() {
           columns={[{ key: "name", label: "Product", render: thumb }, { key: "categoryId", label: "Category", render: (r) => catName.get(r.categoryId) ?? "—" }, { key: "price", label: "Price", render: (r) => <PriceDisplay minor={r.price} currency={cur} /> }, { key: "availability", label: "Availability", render: (r) => <StatusBadge status={r.availability} /> }]} />
       )}
       {tab === "categories" && (
-        <CrudManager key="c" resource="categories" singular="Category" plural="Categories" onChanged={cats.reload} fields={[{ key: "name", label: "Name", type: "text", required: true }, { key: "imageUrl", label: "Image", type: "image" }, { key: "sortOrder", label: "Sort order", type: "number", hint: "Lower numbers appear first" }, { key: "isActive", label: "Active", type: "boolean" }]}
+        <CrudManager key="c" resource="categories" singular="Category" plural="Categories" onChanged={cats.reload} fields={[{ key: "name", label: "Name", type: "text", required: true }, { key: "imageUrl", label: "Image", type: "image", folder: "menu" }, { key: "sortOrder", label: "Sort order", type: "number", hint: "Lower numbers appear first" }, { key: "isActive", label: "Active", type: "boolean" }]}
           defaults={{ name: "", imageUrl: "", sortOrder: 0, isActive: true }} emptyText="Create categories like Coffee, Snacks or Desserts." deleteMessage={(r) => `Delete “${r.name}”? Its products will become uncategorised.`}
           columns={[{ key: "name", label: "Category", render: thumb }, { key: "sortOrder", label: "Order" }, { key: "isActive", label: "Status", render: (r) => onoff(r.isActive) }]} />
       )}

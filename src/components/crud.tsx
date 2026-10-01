@@ -12,6 +12,8 @@ export type CField = {
   type: "text" | "number" | "money" | "textarea" | "select" | "boolean" | "image" | "multi" | "datetime" | "options" | "rewards";
   options?: { value: string; label: string }[];
   source?: { resource: string; label?: string };
+  /** Storage folder for image fields (default "products"). */
+  folder?: "logo" | "menu" | "products" | "scratch";
   required?: boolean;
   hint?: string;
   placeholder?: string;
@@ -96,7 +98,7 @@ function FieldInput({ f, value, onChange }: { f: CField; value: unknown; onChang
     case "boolean":
       return <Toggle checked={!!value} onChange={onChange} label={f.label} />;
     case "image":
-      return <ImageUploader value={(value as string) ?? ""} onChange={onChange} label={f.label} />;
+      return <ImageUploader value={(value as string) ?? ""} onChange={onChange} label={f.label} folder={f.folder} />;
     case "select":
       return f.source ? (
         <SourceSelect field={f} value={(value as string) ?? ""} onChange={onChange} />

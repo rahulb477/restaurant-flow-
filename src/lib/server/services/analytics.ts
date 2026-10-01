@@ -1,6 +1,4 @@
-import { and, eq, gte, lte, sql } from "drizzle-orm";
-import { db } from "@/db";
-import { orders, customers, loyaltyRewards, inventoryTransactions, ingredients } from "@/db/schema";
+import { tenantRepos } from "@/lib/repositories";
 
 export const dayKey = (d: Date, tz: string) => new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
 export const hourOf = (d: Date, tz: string) => Number(new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", hour12: false }).format(d)) % 24;
@@ -31,15 +29,10 @@ export async function buildAnalytics(restaurantId: string, tz: string, range: Ra
   lo.setUTCHours(lo.getUTCHours() - 14);
   const hi = new Date(`${end}T00:00:00Z`);
   hi.setUTCHours(hi.getUTCHours() + 38);
-  const rows = (
-    await db
-      .select()
-      .from(orders)
-      .where(and(eq(orders.restaurantId, restaurantId), gte(orders.createdAt, lo), lte(orders.createdAt, hi), ...(opts.source && opts.source !== "ALL" ? [eq(orders.source, opts.source)] : [])))
-      .limit(10000)
-  ).filter((o) => {
+  const A = tenantRepos(restaurantId).analytics;
+  const rows = (await A.ordersBetween(lo, hi)).filter((o) => {
     const k = dayKey(o.createdAt, tz);
-    return k >= start && k <= end && o.status !== "CANCELLED";
+    return k >= start && k <= end && o.status !== "CANCELLED" && (!opts.source || opts.source === "ALL" || o.source === opts.source);
   });
 
   const days: string[] = [];
@@ -76,13 +69,7 @@ export async function buildAnalytics(restaurantId: string, tz: string, range: Ra
     }
   }
   const startTs = new Date(`${start}T00:00:00Z`); startTs.setUTCHours(startTs.getUTCHours() - 14);
-  const [newCust, unlocked, claimed, lowStock, invTx] = await Promise.all([
-    db.select({ n: sql<number>`count(*)::int` }).from(customers).where(and(eq(customers.restaurantId, restaurantId), gte(customers.createdAt, startTs))),
-    db.select({ n: sql<number>`count(*)::int` }).from(loyaltyRewards).where(and(eq(loyaltyRewards.restaurantId, restaurantId), gte(loyaltyRewards.createdAt, startTs))),
-    db.select({ n: sql<number>`count(*)::int` }).from(loyaltyRewards).where(and(eq(loyaltyRewards.restaurantId, restaurantId), eq(loyaltyRewards.status, "CLAIMED"), gte(loyaltyRewards.createdAt, startTs))),
-    db.select({ n: sql<number>`count(*)::int` }).from(ingredients).where(and(eq(ingredients.restaurantId, restaurantId), eq(ingredients.isActive, true), sql`${ingredients.currentStock} <= ${ingredients.lowStockThreshold}`)),
-    db.select({ n: sql<number>`count(*)::int` }).from(inventoryTransactions).where(and(eq(inventoryTransactions.restaurantId, restaurantId), eq(inventoryTransactions.type, "ORDER_DEDUCTION"), gte(inventoryTransactions.createdAt, startTs))),
-  ]);
+  const [newCust, rewards, lowStock, deductions] = await Promise.all([A.customersCreatedSince(startTs), A.rewardsSince(startTs), A.lowStockIngredients(), A.inventoryDeductionsSince(startTs)]);
   const top = (m: Map<string, { name: string; qty: number; revenue: number }>) => [...m.values()].sort((a, b) => b.revenue - a.revenue).slice(0, 8);
   return {
     range: { start, end },
@@ -98,8 +85,17 @@ export async function buildAnalytics(restaurantId: string, tz: string, range: Ra
     paymentMethods: [...pay.entries()].map(([method, amount]) => ({ method, amount })),
     peakHours: hours,
     sources: [...sources.entries()].map(([source, orders]) => ({ source, orders })),
-    customers: { withProfile: custIds.size, newCustomers: newCust[0].n },
-    loyalty: { unlocked: unlocked[0].n, claimed: claimed[0].n },
-    inventory: { lowStock: lowStock[0].n, deductions: invTx[0].n },
+    customers: { withProfile: custIds.size, newCustomers: newCust },
+    loyalty: rewards,
+    inventory: { lowStock: lowStock.length, deductions },
   };
 }
+
+/** Start of the current calendar day in the restaurant's timezone, as a UTC instant. */
+export function startOfDayInTz(now: Date, tz: string): Date {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).formatToParts(now);
+  const g = (t: string) => Number(parts.find((p) => p.type === t)!.value);
+  const asUtc = Date.UTC(g("year"), g("month") - 1, g("day"), g("hour"), g("minute"), g("second"));
+  return new Date(now.getTime() - (asUtc - Date.UTC(g("year"), g("month") - 1, g("day"))));
+}
+

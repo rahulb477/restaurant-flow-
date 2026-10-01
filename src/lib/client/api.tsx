@@ -74,7 +74,7 @@ export function useApi<T>(url: string | null, opts: { poll?: number } = {}) {
 
   useEffect(() => {
     alive.current = true;
-     
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch on mount / url change
     load();
     return () => {
       alive.current = false;

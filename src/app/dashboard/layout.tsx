@@ -21,7 +21,7 @@ export default async function DashboardLayout({ children }: { children: ReactNod
       whatsapp={s.whatsapp || publicEnv.supportWhatsapp}
       role={ctx.role}
       user={{ name: user.name, email: user.email, emailVerified: user.emailVerified }}
-      restaurant={{ name: r.name, slug: r.slug, logoUrl: r.logoUrl, accent: r.accent, currency: r.currency, timezone: r.timezone }}
+      restaurant={{ id: r.id, name: r.name, slug: r.slug, logoUrl: r.logoUrl, accent: r.accent, currency: r.currency, timezone: r.timezone }}
     >
       {children}
     </Shell>
